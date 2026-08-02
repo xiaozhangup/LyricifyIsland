@@ -133,7 +133,7 @@ internal sealed class SettingsWindow : Window
         Title = "Lyricify Island 设置";
         Icon = icon;
         Width = 420;
-        Height = 620;
+        Height = 740;
         CanResize = false;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         RequestedThemeVariant = ThemeVariant.Dark;
@@ -230,12 +230,32 @@ internal sealed class SettingsWindow : Window
                 credentialStatus
             }
         };
+        var cacheStatus = new TextBlock { Foreground = Brushes.Gray };
+        var clearCache = new Button { HorizontalAlignment = HorizontalAlignment.Stretch };
+        void RefreshCacheSize() => clearCache.Content = $"清理缓存（{TrackCache.FormatSize(TrackCache.Size())}）";
+        RefreshCacheSize();
+        clearCache.Click += (_, _) =>
+        {
+            cacheStatus.Text = TrackCache.Clear() ? "缓存已清理" : "清理失败，请查看终端错误";
+            RefreshCacheSize();
+        };
+        var cache = new StackPanel
+        {
+            Spacing = 7,
+            Children =
+            {
+                new TextBlock { Text = "缓存", FontSize = 18, FontWeight = FontWeight.SemiBold },
+                new TextBlock { Text = "缓存歌词、封面和歌曲信息", Foreground = Brushes.Gray },
+                clearCache,
+                cacheStatus
+            }
+        };
 
         Content = new StackPanel
         {
             Margin = new Thickness(24),
             Spacing = 18,
-            Children = { scale, width, spotify }
+            Children = { scale, width, spotify, cache }
         };
     }
 

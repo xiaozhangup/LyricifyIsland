@@ -340,6 +340,7 @@ internal static class SelfCheck
         Require(!(configured with { SpotifyClientSecret = string.Empty }).HasSpotifyCredentials,
             "incomplete Spotify credential settings");
         CheckSettingsStore();
+        CheckTrackCache(track);
         Require(OverlayWindow.CalculateLogicalHeight(150d) == 174d, "island height scaling");
         Require(Math.Abs(OverlayWindow.CalculateLogicalWidth(1_920, 1.25d, 70d) - 1_075.2d) < 0.001d,
             "screen width scaling");
@@ -387,6 +388,35 @@ internal static class SelfCheck
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", previousConfigHome);
             if (Directory.Exists(configHome))
                 Directory.Delete(configHome, recursive: true);
+        }
+    }
+
+    private static void CheckTrackCache(TrackInfo track)
+    {
+        var previousCacheHome = Environment.GetEnvironmentVariable("XDG_CACHE_HOME");
+        var cacheHome = Path.Combine(Path.GetTempPath(), $"lyricify-island-cache-test-{Guid.NewGuid():N}");
+        try
+        {
+            Environment.SetEnvironmentVariable("XDG_CACHE_HOME", cacheHome);
+            TrackCache.SaveIfChanged(track);
+            var loaded = TrackCache.Load(track.Id);
+            Require(loaded is not null
+                    && loaded.Title == track.Title
+                    && loaded.AlbumArtBytes.SequenceEqual(track.AlbumArtBytes)
+                    && loaded.Lyrics.Length == track.Lyrics.Length
+                    && loaded.Lyrics[0].Text == track.Lyrics[0].Text
+                    && loaded.Lyrics[0].Syllables.Length == track.Lyrics[0].Syllables.Length,
+                "track cache round trip");
+            TrackCache.SaveIfChanged(track with { Title = "updated" });
+            Require(TrackCache.Load(track.Id)?.Title == "updated", "track cache refresh");
+            Require(TrackCache.Size() > 0, "track cache size");
+            Require(TrackCache.Clear() && TrackCache.Size() == 0, "track cache clear");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("XDG_CACHE_HOME", previousCacheHome);
+            if (Directory.Exists(cacheHome))
+                Directory.Delete(cacheHome, recursive: true);
         }
     }
 

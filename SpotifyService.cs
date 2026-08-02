@@ -155,7 +155,7 @@ internal sealed class SpotifyService
             if (currentTrack?.Id != spotifyTrack.Id)
             {
                 CancelTrackLoad();
-                currentTrack = new TrackInfo(
+                currentTrack = TrackCache.Load(spotifyTrack.Id) ?? new TrackInfo(
                     spotifyTrack.Id,
                     spotifyTrack.Title,
                     spotifyTrack.Artists,
@@ -165,18 +165,20 @@ internal sealed class SpotifyService
                     []);
                 Volatile.Write(ref _track, currentTrack);
                 Volatile.Write(ref _loadingTrack, currentTrack);
-                _store.Update(new PlaybackSnapshot(
-                    currentTrack, position, reportedAt, isPlaying, "正在获取歌词…"));
+                _store.Update(new PlaybackSnapshot(currentTrack, position, reportedAt, isPlaying,
+                    currentTrack.Lyrics.IsDefaultOrEmpty
+                        ? "正在获取歌词…"
+                        : string.Join(", ", currentTrack.Artists)));
                 _trackLoad = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 _ = CompleteTrackAsync(spotifyTrack, currentTrack, _trackLoad.Token);
             }
 
             currentTrack = Volatile.Read(ref _track)!;
-            var status = ReferenceEquals(currentTrack, Volatile.Read(ref _loadingTrack))
-                ? "正在获取歌词…"
-                : currentTrack.Lyrics.IsDefaultOrEmpty
-                    ? $"未找到歌词 · {string.Join(", ", currentTrack.Artists)}"
-                    : string.Join(", ", currentTrack.Artists);
+            var status = currentTrack.Lyrics.IsDefaultOrEmpty
+                ? ReferenceEquals(currentTrack, Volatile.Read(ref _loadingTrack))
+                    ? "正在获取歌词…"
+                    : $"未找到歌词 · {string.Join(", ", currentTrack.Artists)}"
+                : string.Join(", ", currentTrack.Artists);
             _store.Update(new PlaybackSnapshot(currentTrack, position, reportedAt, isPlaying, status));
             return PollInterval;
         }
@@ -192,11 +194,17 @@ internal sealed class SpotifyService
             var lyricsTask = LoadLyricsSafeAsync(spotifyTrack, cancellationToken);
             var albumTask = LoadAlbumArtSafeAsync(spotifyTrack.AlbumArtUrl, cancellationToken);
             await Task.WhenAll(lyricsTask, albumTask);
-            var loaded = placeholder with
-            {
-                AlbumArtBytes = await albumTask,
-                Lyrics = await lyricsTask
-            };
+            var lyrics = await lyricsTask;
+            var album = await albumTask;
+            var loaded = new TrackInfo(
+                spotifyTrack.Id,
+                spotifyTrack.Title,
+                spotifyTrack.Artists,
+                spotifyTrack.Album,
+                spotifyTrack.DurationMs,
+                album.IsEmpty ? placeholder.AlbumArtBytes : album,
+                lyrics.IsEmpty ? placeholder.Lyrics : lyrics);
+            TrackCache.SaveIfChanged(loaded);
             if (Interlocked.CompareExchange(ref _track, loaded, placeholder) == placeholder)
                 Interlocked.CompareExchange(ref _loadingTrack, null, placeholder);
         }

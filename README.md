@@ -27,7 +27,7 @@ Linux 桌面顶置歌词岛。当前曲目和播放进度来自 Spotify Web API�
 
 Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账号加入应用用户列表。
 程序启动后常驻系统托盘；托盘菜单提供“设置”和“退出”。
-黑色岛屿区域支持按住左键拖动、左键双击隐藏 2 秒，区域外保持鼠标穿透；
+黑色岛屿区域支持按住左键拖动、左键双击透明穿透 2 秒，区域外保持鼠标穿透；
 右键菜单提供“隐藏2s”“居中”和“退出”，其中“居中”只调整水平位置。
 
 ## 本地验收
@@ -49,9 +49,11 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 - 整体缩放：50%–200%，默认 100%，同步缩放字体、图标、胶囊、间距和光效。
 - 最大宽度：可用屏幕宽度的 40%–100%，默认 70%。
 - Spotify Client ID 和 Client Secret：点击保存后重新连接，Secret 在界面中遮蔽显示。
+- 缓存：显示歌词、封面和歌曲信息缓存占用，并可一键清理。
 
 设置保存在 `$XDG_CONFIG_HOME/lyricify-island/settings.json`；未设置 `XDG_CONFIG_HOME` 时使用
 `~/.config/lyricify-island/settings.json`。Linux 下设置目录权限为 `0700`，文件权限为 `0600`。
+歌曲缓存保存在 `$XDG_CACHE_HOME/lyricify-island/tracks`；未设置时使用 `~/.cache`。
 
 环境变量均为可选：
 

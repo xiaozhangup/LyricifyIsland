@@ -23,6 +23,7 @@ public sealed class OverlayWindow : Window
     private NativeOverlay? _nativeOverlay;
     private bool _opened;
     private bool _closed;
+    private bool _temporarilyHidden;
 
     internal OverlayWindow(PlaybackStore store, IslandSettings settings, Action exit)
     {
@@ -41,7 +42,8 @@ public sealed class OverlayWindow : Window
 
         _island = new IslandControl(store);
         _island.SetScale(_settings.ScalePercent / 100d);
-        _island.PillBoundsChanged += bounds => _nativeOverlay?.SetInputRegion(bounds, RenderScaling);
+        _island.PillBoundsChanged += bounds =>
+            _nativeOverlay?.SetInputRegion(bounds, RenderScaling, _temporarilyHidden);
         _island.PointerPressed += (_, args) =>
         {
             if (args.GetCurrentPoint(_island).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonPressed)
@@ -78,7 +80,7 @@ public sealed class OverlayWindow : Window
                     Environment.GetEnvironmentVariable("LYRICIFY_CLICK_THROUGH") == "1");
             }
             _nativeOverlay?.RestoreWindowState();
-            _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling);
+            _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling, _temporarilyHidden);
         };
         Closed += (_, _) =>
         {
@@ -112,12 +114,18 @@ public sealed class OverlayWindow : Window
 
     private async Task HideForTwoSecondsAsync()
     {
-        if (!IsVisible)
+        if (_temporarilyHidden)
             return;
-        Hide();
+        _temporarilyHidden = true;
+        Opacity = 0;
+        _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling, transparent: true);
         await Task.Delay(TimeSpan.FromSeconds(2));
         if (!_closed)
-            Show();
+        {
+            _temporarilyHidden = false;
+            _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling);
+            Opacity = 1;
+        }
     }
 
     private void CenterHorizontally()
@@ -158,6 +166,7 @@ public sealed class IslandControl : Control, IDisposable
     private long _transitionAt;
     private double _scale = 1d;
     private Rect _pillBounds;
+    private PlaybackSnapshot? _renderedSnapshot;
 
     internal Rect PillBounds => _pillBounds;
     internal event Action<Rect>? PillBoundsChanged;
@@ -166,7 +175,12 @@ public sealed class IslandControl : Control, IDisposable
     {
         _store = store;
         _timer = new DispatcherTimer(TimeSpan.FromMilliseconds(1000d / 60d), DispatcherPriority.Render,
-            (_, _) => InvalidateVisual());
+            (_, _) =>
+            {
+                var snapshot = _store.Snapshot;
+                if (snapshot.IsPlaying || _outgoing is not null || !ReferenceEquals(snapshot, _renderedSnapshot))
+                    InvalidateVisual();
+            });
         _timer.Start();
     }
 
@@ -179,6 +193,7 @@ public sealed class IslandControl : Control, IDisposable
     public override void Render(DrawingContext context)
     {
         var snapshot = _store.Snapshot;
+        _renderedSnapshot = snapshot;
         var position = CurrentPosition(snapshot);
         var track = snapshot.Track;
 
@@ -321,12 +336,40 @@ internal sealed class IslandRenderer : IDisposable
         "Noto Sans CJK SC", SKFontStyleWeight.Medium, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright);
     private readonly SKTypeface _japanese = SKTypeface.FromFamilyName(
         "Noto Sans CJK JP", SKFontStyleWeight.Medium, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright);
+    private readonly SKFont _latinFont;
+    private readonly SKFont _cjkFont;
+    private readonly SKFont _japaneseFont;
+    private readonly SKFont _translationFont;
+    private readonly SKPaint _shadow = Paint(new SKColor(0, 0, 0, 115), 7f);
+    private readonly SKPaint _fill = Paint(new SKColor(3, 5, 7, 170));
+    private readonly SKPaint _rim = new()
+    {
+        IsAntialias = true,
+        Style = SKPaintStyle.Stroke,
+        StrokeWidth = 1f,
+        Color = new SKColor(255, 255, 255, 10)
+    };
+    private readonly SKPaint _iconGlow = Paint(new SKColor(35, 255, 110, 95), 4f);
+    private readonly SKPaint _imagePaint = Paint(SKColors.White);
+    private readonly SKPaint _placeholderPaint = Paint(new SKColor(38, 42, 46));
+    private readonly SKPaint _translationPaint = Paint(new SKColor(160, 161, 166, 220));
+    private readonly SKPaint _idlePaint = Paint(new SKColor(108, 109, 114, 225));
+    private readonly SKPaint _wideGlow = Paint(new SKColor(255, 255, 255, 42), 1.65f);
+    private readonly SKPaint _tightGlow = Paint(new SKColor(255, 255, 255, 70), 0.85f);
+    private readonly SKPaint _corePaint = Paint(new SKColor(247, 248, 249));
+    private readonly SKPaint _edgeBloom = Paint(new SKColor(255, 255, 255, 78), 3.8f);
+    private readonly SKPaint _titlePaint = Paint(new SKColor(242, 243, 244));
+    private readonly SKPaint _subtitlePaint = Paint(new SKColor(145, 146, 151));
     private readonly SKBitmap? _icon;
     private TrackInfo? _albumTrack;
     private SKImage? _album;
 
     public IslandRenderer()
     {
+        _latinFont = CreateFont(_latin, MainSize);
+        _cjkFont = CreateFont(_cjk, MainSize);
+        _japaneseFont = CreateFont(_japanese, MainSize);
+        _translationFont = CreateFont(_cjk, TranslationSize);
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("LyricifyIsland.icon.png");
         if (stream is not null)
             _icon = SKBitmap.Decode(stream);
@@ -341,11 +384,7 @@ internal sealed class IslandRenderer : IDisposable
         width /= visualScale;
         height /= visualScale;
 
-        using var latinFont = CreateFont(_latin, MainSize);
-        using var cjkFont = CreateFont(_cjk, MainSize);
-        using var japaneseFont = CreateFont(_japanese, MainSize);
-        using var translationFont = CreateFont(_cjk, TranslationSize);
-        var mainFonts = new MainFontSet(latinFont, cjkFont, japaneseFont);
+        var mainFonts = new MainFontSet(_latinFont, _cjkFont, _japaneseFont);
 
         var pillRect = calculatedPillBounds is { } bounds
             ? new SKRect(
@@ -353,7 +392,7 @@ internal sealed class IslandRenderer : IDisposable
                 (float)(bounds.Top / visualScale),
                 (float)(bounds.Right / visualScale),
                 (float)(bounds.Bottom / visualScale))
-            : PillRect(width, height, frame, mainFonts, translationFont);
+            : PillRect(width, height, frame, mainFonts, _translationFont);
         var pillHeight = pillRect.Height;
         var pillLeft = pillRect.Left;
         var pillTop = pillRect.Top;
@@ -371,7 +410,7 @@ internal sealed class IslandRenderer : IDisposable
         if (frame.Outgoing is not null && frame.TransitionSeconds < 0.12)
         {
             var p = Math.Clamp(frame.TransitionSeconds / 0.11, 0d, 1d);
-            DrawLineBlock(canvas, frame.Outgoing, frame.PositionMs, clip, mainFonts, translationFont,
+            DrawLineBlock(canvas, frame.Outgoing, frame.PositionMs, clip, mainFonts, _translationFont,
                 1f - 0.25f * (float)EaseOutCubic(p), (float)(1d - EaseOutCubic(p)));
         }
 
@@ -382,12 +421,12 @@ internal sealed class IslandRenderer : IDisposable
                 ? 1d
                 : Math.Clamp((frame.TransitionSeconds - incomingStart) / 0.60d, 0d, 1d);
             var scale = frame.Outgoing is null ? 1f : (float)(0.75d + 0.25d * Spring(p));
-            DrawLineBlock(canvas, frame.Line, frame.PositionMs, clip, mainFonts, translationFont,
+            DrawLineBlock(canvas, frame.Line, frame.PositionMs, clip, mainFonts, _translationFont,
                 scale, (float)EaseOutCubic(p));
         }
         else if (frame.Line is null)
         {
-            DrawStatus(canvas, frame, clip, mainFonts, translationFont);
+            DrawStatus(canvas, frame, clip, mainFonts, _translationFont);
         }
 
         canvas.Restore();
@@ -397,16 +436,12 @@ internal sealed class IslandRenderer : IDisposable
     internal Rect CalculatePillBounds(float width, float height, IslandFrame frame)
     {
         var visualScale = (float)Math.Clamp(frame.Scale, 0.5d, 2d);
-        using var latinFont = CreateFont(_latin, MainSize);
-        using var cjkFont = CreateFont(_cjk, MainSize);
-        using var japaneseFont = CreateFont(_japanese, MainSize);
-        using var translationFont = CreateFont(_cjk, TranslationSize);
         var pill = PillRect(
             width / visualScale,
             height / visualScale,
             frame,
-            new MainFontSet(latinFont, cjkFont, japaneseFont),
-            translationFont);
+            new MainFontSet(_latinFont, _cjkFont, _japaneseFont),
+            _translationFont);
         return new Rect(
             pill.Left * visualScale,
             pill.Top * visualScale,
@@ -449,27 +484,11 @@ internal sealed class IslandRenderer : IDisposable
 
     private void DrawPill(SKCanvas canvas, SKRect rect)
     {
-        using var shadow = new SKPaint
-        {
-            IsAntialias = true,
-            Color = new SKColor(0, 0, 0, 115),
-            MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 7f)
-        };
         var shadowRect = rect;
         shadowRect.Offset(0, 3f);
-        canvas.DrawRoundRect(shadowRect, rect.Height / 2f, rect.Height / 2f, shadow);
-
-        using var fill = new SKPaint { IsAntialias = true, Color = new SKColor(3, 5, 7, 170) };
-        canvas.DrawRoundRect(rect, rect.Height / 2f, rect.Height / 2f, fill);
-
-        using var rim = new SKPaint
-        {
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke,
-            StrokeWidth = 1f,
-            Color = new SKColor(255, 255, 255, 10)
-        };
-        canvas.DrawRoundRect(rect, rect.Height / 2f, rect.Height / 2f, rim);
+        canvas.DrawRoundRect(shadowRect, rect.Height / 2f, rect.Height / 2f, _shadow);
+        canvas.DrawRoundRect(rect, rect.Height / 2f, rect.Height / 2f, _fill);
+        canvas.DrawRoundRect(rect, rect.Height / 2f, rect.Height / 2f, _rim);
     }
 
     private void DrawSides(SKCanvas canvas, IslandFrame frame, SKRect pill)
@@ -478,12 +497,7 @@ internal sealed class IslandRenderer : IDisposable
 
         if (_icon is not null)
         {
-            using var glow = new SKPaint
-            {
-                Color = new SKColor(35, 255, 110, 95),
-                MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 4f)
-            };
-            canvas.DrawBitmap(_icon, iconRect, glow);
+            canvas.DrawBitmap(_icon, iconRect, _iconGlow);
             canvas.DrawBitmap(_icon, iconRect);
         }
 
@@ -493,14 +507,12 @@ internal sealed class IslandRenderer : IDisposable
         canvas.ClipRoundRect(new SKRoundRect(albumRect, 5f), SKClipOperation.Intersect, true);
         if (_album is not null)
         {
-            using var imagePaint = new SKPaint { IsAntialias = true };
             canvas.DrawImage(_album, albumRect,
-                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear), imagePaint);
+                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear), _imagePaint);
         }
         else
         {
-            using var placeholder = new SKPaint { Color = new SKColor(38, 42, 46) };
-            canvas.DrawRect(albumRect, placeholder);
+            canvas.DrawRect(albumRect, _placeholderPaint);
         }
         canvas.Restore();
     }
@@ -537,17 +549,13 @@ internal sealed class IslandRenderer : IDisposable
 
         if (hasTranslation)
         {
-            using var translationPaint = new SKPaint
-            {
-                IsAntialias = true,
-                Color = new SKColor(160, 161, 166, (byte)(220 * opacity))
-            };
-            canvas.DrawText(translation, centerX - translationWidth / 2f, originY + 24f, translationFont, translationPaint);
+            _translationPaint.Color = new SKColor(160, 161, 166, (byte)(220 * opacity));
+            canvas.DrawText(translation, centerX - translationWidth / 2f, originY + 24f, translationFont, _translationPaint);
         }
         canvas.Restore();
     }
 
-    private static void DrawKaraokeText(
+    private void DrawKaraokeText(
         SKCanvas canvas,
         LyricLine line,
         long positionMs,
@@ -557,12 +565,8 @@ internal sealed class IslandRenderer : IDisposable
         MainFontSet fonts,
         float opacity)
     {
-        using var idle = new SKPaint
-        {
-            IsAntialias = true,
-            Color = new SKColor(108, 109, 114, (byte)(225 * opacity))
-        };
-        DrawMainText(canvas, runs, x, baseline, idle);
+        _idlePaint.Color = new SKColor(108, 109, 114, (byte)(225 * opacity));
+        DrawMainText(canvas, runs, x, baseline, _idlePaint);
 
         var activeWidth = ActiveWidth(line, positionMs, fonts);
         if (activeWidth <= 0f)
@@ -572,40 +576,19 @@ internal sealed class IslandRenderer : IDisposable
         canvas.Save();
         canvas.ClipRect(new SKRect(x - 10f, baseline - 38f, activeRight + 5f, baseline + 11f));
 
-        using var wideGlow = new SKPaint
-        {
-            IsAntialias = true,
-            Color = new SKColor(255, 255, 255, (byte)(42 * opacity)),
-            MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 1.65f)
-        };
-        DrawMainText(canvas, runs, x, baseline, wideGlow);
-
-        using var tightGlow = new SKPaint
-        {
-            IsAntialias = true,
-            Color = new SKColor(255, 255, 255, (byte)(70 * opacity)),
-            MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 0.85f)
-        };
-        DrawMainText(canvas, runs, x, baseline, tightGlow);
-
-        using var core = new SKPaint
-        {
-            IsAntialias = true,
-            Color = new SKColor(247, 248, 249, (byte)(255 * opacity))
-        };
-        DrawMainText(canvas, runs, x, baseline, core);
+        _wideGlow.Color = new SKColor(255, 255, 255, (byte)(42 * opacity));
+        DrawMainText(canvas, runs, x, baseline, _wideGlow);
+        _tightGlow.Color = new SKColor(255, 255, 255, (byte)(70 * opacity));
+        DrawMainText(canvas, runs, x, baseline, _tightGlow);
+        _corePaint.Color = new SKColor(247, 248, 249, (byte)(255 * opacity));
+        DrawMainText(canvas, runs, x, baseline, _corePaint);
         canvas.Restore();
 
         // A brighter, wider pass only around the moving edge produces the soft bloom in the reference.
         canvas.Save();
         canvas.ClipRect(new SKRect(activeRight - 10f, baseline - 39f, activeRight + 8f, baseline + 12f));
-        using var edgeBloom = new SKPaint
-        {
-            IsAntialias = true,
-            Color = new SKColor(255, 255, 255, (byte)(78 * opacity)),
-            MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 3.8f)
-        };
-        DrawMainText(canvas, runs, x, baseline, edgeBloom);
+        _edgeBloom.Color = new SKColor(255, 255, 255, (byte)(78 * opacity));
+        DrawMainText(canvas, runs, x, baseline, _edgeBloom);
         canvas.Restore();
     }
 
@@ -657,13 +640,11 @@ internal sealed class IslandRenderer : IDisposable
     {
         var title = frame.Track?.Title ?? frame.Status ?? "等待 Spotify";
         var subtitle = StatusSubtitle(frame.Track, frame.Status);
-        using var titlePaint = new SKPaint { IsAntialias = true, Color = new SKColor(242, 243, 244) };
-        using var subPaint = new SKPaint { IsAntialias = true, Color = new SKColor(145, 146, 151) };
         var titleLayout = LayoutMainText(title, mainFonts);
         var subtitleWidth = translationFont.MeasureText(subtitle);
         var originY = clip.MidY + DoubleLineOriginOffset;
-        DrawMainText(canvas, titleLayout.Runs, clip.MidX - titleLayout.Width / 2f, originY - 5f, titlePaint);
-        canvas.DrawText(subtitle, clip.MidX - subtitleWidth / 2f, originY + 24f, translationFont, subPaint);
+        DrawMainText(canvas, titleLayout.Runs, clip.MidX - titleLayout.Width / 2f, originY - 5f, _titlePaint);
+        canvas.DrawText(subtitle, clip.MidX - subtitleWidth / 2f, originY + 24f, translationFont, _subtitlePaint);
     }
 
     private static float DesiredWidth(
@@ -717,6 +698,13 @@ internal sealed class IslandRenderer : IDisposable
     {
         Edging = SKFontEdging.Antialias,
         Subpixel = true
+    };
+
+    private static SKPaint Paint(SKColor color, float blur = 0f) => new()
+    {
+        IsAntialias = true,
+        Color = color,
+        MaskFilter = blur > 0f ? SKMaskFilter.CreateBlur(SKBlurStyle.Normal, blur) : null
     };
 
     private static (List<MainTextRun> Runs, float Width) LayoutMainText(string text, MainFontSet fonts)
@@ -833,7 +821,7 @@ internal sealed class IslandRenderer : IDisposable
         _albumTrack = track;
         _album?.Dispose();
         _album = track is { AlbumArtBytes.Length: > 0 }
-            ? SKImage.FromEncodedData(track.AlbumArtBytes.AsSpan().ToArray())
+            ? SKImage.FromEncodedData(track.AlbumArtBytes.AsSpan())
             : null;
     }
 
@@ -860,6 +848,24 @@ internal sealed class IslandRenderer : IDisposable
     {
         _icon?.Dispose();
         _album?.Dispose();
+        _latinFont.Dispose();
+        _cjkFont.Dispose();
+        _japaneseFont.Dispose();
+        _translationFont.Dispose();
+        _shadow.Dispose();
+        _fill.Dispose();
+        _rim.Dispose();
+        _iconGlow.Dispose();
+        _imagePaint.Dispose();
+        _placeholderPaint.Dispose();
+        _translationPaint.Dispose();
+        _idlePaint.Dispose();
+        _wideGlow.Dispose();
+        _tightGlow.Dispose();
+        _corePaint.Dispose();
+        _edgeBloom.Dispose();
+        _titlePaint.Dispose();
+        _subtitlePaint.Dispose();
         _latin.Dispose();
         _cjk.Dispose();
         _japanese.Dispose();
@@ -890,6 +896,7 @@ internal sealed class NativeOverlay : IDisposable
     private readonly bool _clickThrough;
     private PixelRect? _inputBounds;
     private bool _inputConfigured;
+    private bool _inputTransparent;
     private bool _shapeAvailable = true;
 
     private NativeOverlay(IntPtr display, IntPtr window, bool clickThrough)
@@ -923,19 +930,20 @@ internal sealed class NativeOverlay : IDisposable
         }
     }
 
-    public void SetInputRegion(Rect logicalBounds, double scaling)
+    public void SetInputRegion(Rect logicalBounds, double scaling, bool transparent = false)
     {
         if (_display == IntPtr.Zero || !_shapeAvailable)
             return;
 
         var bounds = PhysicalBounds(logicalBounds, scaling);
-        if (_inputConfigured && (_clickThrough || _inputBounds == bounds))
+        transparent |= _clickThrough;
+        if (_inputConfigured && _inputTransparent == transparent && (transparent || _inputBounds == bounds))
             return;
 
         var region = IntPtr.Zero;
         try
         {
-            if (_clickThrough)
+            if (transparent)
             {
                 region = XFixesCreateRegion(_display, IntPtr.Zero, 0);
             }
@@ -962,6 +970,7 @@ internal sealed class NativeOverlay : IDisposable
             XFlush(_display);
             _inputBounds = bounds;
             _inputConfigured = true;
+            _inputTransparent = transparent;
         }
         catch (Exception exception) when (exception is DllNotFoundException or EntryPointNotFoundException)
         {
