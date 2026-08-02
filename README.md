@@ -27,6 +27,8 @@ Linux 桌面顶置歌词岛。当前曲目和播放进度来自 Spotify Web API�
 
 Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账号加入应用用户列表。
 程序启动后常驻系统托盘；托盘菜单提供“设置”和“退出”。
+黑色岛屿区域支持按住左键拖动、左键双击隐藏 2 秒，区域外保持鼠标穿透；
+右键菜单提供“隐藏2s”“居中”和“退出”，其中“居中”只调整水平位置。
 
 ## 本地验收
 
@@ -55,7 +57,7 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 
 - `LYRICIFY_Y=58`：浮层距屏幕顶边的位置。
 - `LYRICIFY_OFFSET_MS=0`：歌词同步偏移，正数使高亮更靠后。
-- `LYRICIFY_CLICK_THROUGH=0`：关闭鼠标穿透，便于窗口调试。
+- `LYRICIFY_CLICK_THROUGH=1`：恢复全窗口鼠标穿透，同时关闭岛屿鼠标交互。
 
 程序在 Linux 上使用 Avalonia 的 X11/XWayland 后端，以便在 GNOME Wayland 会话中可靠定位、置顶和鼠标穿透。
 Fedora 缺少运行依赖时可安装：

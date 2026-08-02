@@ -19,7 +19,7 @@ cat >"$topdir/SPECS/lyricify-island.spec" <<EOF
 %global __strip /bin/true
 Name:           lyricify-island
 Version:        $version
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Spotify desktop lyrics island
 License:        MIT AND Apache-2.0
 URL:            https://github.com/xiaozhangup/LyricifyIsland

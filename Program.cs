@@ -94,7 +94,7 @@ public sealed class App : Application
         {
             _store = new PlaybackStore();
             _settings = SettingsStore.Load();
-            _overlay = new OverlayWindow(_store, _settings);
+            _overlay = new OverlayWindow(_store, _settings, () => desktop.Shutdown());
             desktop.MainWindow = _overlay;
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             CreateTrayIcon(desktop);
@@ -343,6 +343,19 @@ internal static class SelfCheck
         Require(OverlayWindow.CalculateLogicalHeight(150d) == 174d, "island height scaling");
         Require(Math.Abs(OverlayWindow.CalculateLogicalWidth(1_920, 1.25d, 70d) - 1_075.2d) < 0.001d,
             "screen width scaling");
+        using var hitTestRenderer = new IslandRenderer();
+        var hitTestFrame = new IslandFrame(track, track.Lyrics[0], null, 1_000, true, "test", 99d, 1d);
+        var pillBounds = hitTestRenderer.CalculatePillBounds(960, 116, hitTestFrame);
+        Require(IslandRenderer.HitTest(pillBounds, new Point(480, 58)), "island hit test");
+        Require(!IslandRenderer.HitTest(pillBounds, new Point(0, 0)), "transparent hit test");
+        Require(OverlayWindow.CenteredHorizontally(
+                new PixelPoint(0, 321), new PixelRect(100, 0, 1_000, 500), 400)
+            == new PixelPoint(400, 321), "horizontal-only centering");
+        var inputRows = NativeOverlay.CapsuleRows(new PixelRect(10, 20, 100, 40));
+        Require(inputRows.Length == 40
+                && inputRows[0].X > 10
+                && inputRows[20] == new PixelRect(10, 40, 100, 1),
+            "rounded native input region");
 
         Console.WriteLine("self-test: ok");
         return 0;

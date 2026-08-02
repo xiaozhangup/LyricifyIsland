@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Platform;
 using Avalonia.Rendering.SceneGraph;
@@ -19,8 +20,11 @@ public sealed class OverlayWindow : Window
     private const double BaseHeight = 116d;
     private readonly IslandControl _island;
     private IslandSettings _settings;
+    private NativeOverlay? _nativeOverlay;
+    private bool _opened;
+    private bool _closed;
 
-    internal OverlayWindow(PlaybackStore store, IslandSettings settings)
+    internal OverlayWindow(PlaybackStore store, IslandSettings settings, Action exit)
     {
         _settings = SettingsStore.Normalize(settings);
         Width = 960;
@@ -37,19 +41,50 @@ public sealed class OverlayWindow : Window
 
         _island = new IslandControl(store);
         _island.SetScale(_settings.ScalePercent / 100d);
+        _island.PillBoundsChanged += bounds => _nativeOverlay?.SetInputRegion(bounds, RenderScaling);
+        _island.PointerPressed += (_, args) =>
+        {
+            if (args.GetCurrentPoint(_island).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonPressed)
+                return;
+            if (args.ClickCount == 2)
+            {
+                args.Handled = true;
+                _ = HideForTwoSecondsAsync();
+            }
+            else
+            {
+                BeginMoveDrag(args);
+            }
+        };
+
+        var hide = new MenuItem { Header = "隐藏2s" };
+        hide.Click += (_, _) => _ = HideForTwoSecondsAsync();
+        var center = new MenuItem { Header = "居中" };
+        center.Click += (_, _) => CenterHorizontally();
+        var exitItem = new MenuItem { Header = "退出" };
+        exitItem.Click += (_, _) => exit();
+        _island.ContextMenu = new ContextMenu { ItemsSource = new[] { hide, center, exitItem } };
         Content = _island;
 
         Opened += (_, _) =>
         {
-            ApplyGeometry();
-            Screens.Changed += ScreensChanged;
-            NativeOverlay.TryConfigure(
-                this,
-                Environment.GetEnvironmentVariable("LYRICIFY_CLICK_THROUGH") != "0");
+            if (!_opened)
+            {
+                _opened = true;
+                ApplyGeometry();
+                Screens.Changed += ScreensChanged;
+                _nativeOverlay = NativeOverlay.TryCreate(
+                    this,
+                    Environment.GetEnvironmentVariable("LYRICIFY_CLICK_THROUGH") == "1");
+            }
+            _nativeOverlay?.RestoreWindowState();
+            _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling);
         };
         Closed += (_, _) =>
         {
+            _closed = true;
             Screens.Changed -= ScreensChanged;
+            _nativeOverlay?.Dispose();
             _island.Dispose();
         };
     }
@@ -74,6 +109,26 @@ public sealed class OverlayWindow : Window
         BaseHeight * SettingsStore.NormalizeScalePercent(scalePercent) / 100d;
 
     private void ScreensChanged(object? sender, EventArgs args) => ApplyGeometry();
+
+    private async Task HideForTwoSecondsAsync()
+    {
+        if (!IsVisible)
+            return;
+        Hide();
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        if (!_closed)
+            Show();
+    }
+
+    private void CenterHorizontally()
+    {
+        var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary ?? Screens.All.First();
+        var physicalWidth = (int)Math.Round(Bounds.Width * RenderScaling);
+        Position = CenteredHorizontally(Position, screen.WorkingArea, physicalWidth);
+    }
+
+    internal static PixelPoint CenteredHorizontally(PixelPoint position, PixelRect area, int width) =>
+        new(area.X + (area.Width - width) / 2, position.Y);
 
     private void ApplyGeometry()
     {
@@ -102,11 +157,14 @@ public sealed class IslandControl : Control, IDisposable
     private LyricLine? _outgoing;
     private long _transitionAt;
     private double _scale = 1d;
+    private Rect _pillBounds;
+
+    internal Rect PillBounds => _pillBounds;
+    internal event Action<Rect>? PillBoundsChanged;
 
     public IslandControl(PlaybackStore store)
     {
         _store = store;
-        IsHitTestVisible = false;
         _timer = new DispatcherTimer(TimeSpan.FromMilliseconds(1000d / 60d), DispatcherPriority.Render,
             (_, _) => InvalidateVisual());
         _timer.Start();
@@ -166,7 +224,13 @@ public sealed class IslandControl : Control, IDisposable
             snapshot.Status,
             transitionSeconds,
             _scale);
-        context.Custom(new IslandDrawOperation(new Rect(Bounds.Size), _renderer, frame));
+        var pillBounds = _renderer.CalculatePillBounds((float)Bounds.Width, (float)Bounds.Height, frame);
+        if (pillBounds != _pillBounds)
+        {
+            _pillBounds = pillBounds;
+            PillBoundsChanged?.Invoke(pillBounds);
+        }
+        context.Custom(new IslandDrawOperation(new Rect(Bounds.Size), _renderer, frame, pillBounds));
     }
 
     private static long CurrentPosition(PlaybackSnapshot snapshot)
@@ -210,7 +274,7 @@ public sealed class IslandControl : Control, IDisposable
     }
 }
 
-internal sealed class IslandDrawOperation(Rect bounds, IslandRenderer renderer, IslandFrame frame)
+internal sealed class IslandDrawOperation(Rect bounds, IslandRenderer renderer, IslandFrame frame, Rect pillBounds)
     : ICustomDrawOperation
 {
     public Rect Bounds { get; } = bounds;
@@ -223,10 +287,10 @@ internal sealed class IslandDrawOperation(Rect bounds, IslandRenderer renderer, 
 
         using var lease = feature.Lease();
         RendererDiagnostics.Observe(lease.GrContext is not null);
-        renderer.Draw(lease.SkCanvas, (float)Bounds.Width, (float)Bounds.Height, frame);
+        renderer.Draw(lease.SkCanvas, (float)Bounds.Width, (float)Bounds.Height, frame, pillBounds);
     }
 
-    public bool HitTest(Point p) => false;
+    public bool HitTest(Point p) => IslandRenderer.HitTest(pillBounds, p);
     public bool Equals(ICustomDrawOperation? other) => false;
     public void Dispose() { }
 }
@@ -268,7 +332,7 @@ internal sealed class IslandRenderer : IDisposable
             _icon = SKBitmap.Decode(stream);
     }
 
-    public void Draw(SKCanvas canvas, float width, float height, IslandFrame frame)
+    public void Draw(SKCanvas canvas, float width, float height, IslandFrame frame, Rect? calculatedPillBounds = null)
     {
         var visualScale = (float)Math.Clamp(frame.Scale, 0.5d, 2d);
         canvas.Save();
@@ -283,16 +347,16 @@ internal sealed class IslandRenderer : IDisposable
         using var translationFont = CreateFont(_cjk, TranslationSize);
         var mainFonts = new MainFontSet(latinFont, cjkFont, japaneseFont);
 
-        var settledWidth = DesiredWidth(frame.Track, frame.Line, frame.Status, mainFonts, translationFont);
-        var outgoingWidth = DesiredWidth(frame.Track, frame.Outgoing, frame.Status, mainFonts, translationFont);
-        var pillWidth = Math.Min(width - 16f, AnimatedWidth(outgoingWidth, settledWidth, frame.TransitionSeconds));
-        var pillHeight = AnimatedHeight(
-            DesiredPillHeight(frame.Outgoing ?? frame.Line),
-            DesiredPillHeight(frame.Line),
-            frame.TransitionSeconds);
-        var pillLeft = (width - pillWidth) / 2f;
-        var pillTop = (height - pillHeight) / 2f - 2f;
-        var pillRect = new SKRect(pillLeft, pillTop, pillLeft + pillWidth, pillTop + pillHeight);
+        var pillRect = calculatedPillBounds is { } bounds
+            ? new SKRect(
+                (float)(bounds.Left / visualScale),
+                (float)(bounds.Top / visualScale),
+                (float)(bounds.Right / visualScale),
+                (float)(bounds.Bottom / visualScale))
+            : PillRect(width, height, frame, mainFonts, translationFont);
+        var pillHeight = pillRect.Height;
+        var pillLeft = pillRect.Left;
+        var pillTop = pillRect.Top;
 
         DrawPill(canvas, pillRect);
         DrawSides(canvas, frame, pillRect);
@@ -328,6 +392,59 @@ internal sealed class IslandRenderer : IDisposable
 
         canvas.Restore();
         canvas.Restore();
+    }
+
+    internal Rect CalculatePillBounds(float width, float height, IslandFrame frame)
+    {
+        var visualScale = (float)Math.Clamp(frame.Scale, 0.5d, 2d);
+        using var latinFont = CreateFont(_latin, MainSize);
+        using var cjkFont = CreateFont(_cjk, MainSize);
+        using var japaneseFont = CreateFont(_japanese, MainSize);
+        using var translationFont = CreateFont(_cjk, TranslationSize);
+        var pill = PillRect(
+            width / visualScale,
+            height / visualScale,
+            frame,
+            new MainFontSet(latinFont, cjkFont, japaneseFont),
+            translationFont);
+        return new Rect(
+            pill.Left * visualScale,
+            pill.Top * visualScale,
+            pill.Width * visualScale,
+            pill.Height * visualScale);
+    }
+
+    internal static bool HitTest(Rect pill, Point point)
+    {
+        if (!pill.Contains(point))
+            return false;
+
+        var radius = pill.Height / 2d;
+        if (point.X >= pill.Left + radius && point.X <= pill.Right - radius)
+            return true;
+        var centerX = point.X < pill.Center.X ? pill.Left + radius : pill.Right - radius;
+        var dx = point.X - centerX;
+        var dy = point.Y - pill.Center.Y;
+        return dx * dx + dy * dy <= radius * radius;
+    }
+
+    private static SKRect PillRect(
+        float width,
+        float height,
+        IslandFrame frame,
+        MainFontSet mainFonts,
+        SKFont translationFont)
+    {
+        var settledWidth = DesiredWidth(frame.Track, frame.Line, frame.Status, mainFonts, translationFont);
+        var outgoingWidth = DesiredWidth(frame.Track, frame.Outgoing, frame.Status, mainFonts, translationFont);
+        var pillWidth = Math.Min(width - 16f, AnimatedWidth(outgoingWidth, settledWidth, frame.TransitionSeconds));
+        var pillHeight = AnimatedHeight(
+            DesiredPillHeight(frame.Outgoing ?? frame.Line),
+            DesiredPillHeight(frame.Line),
+            frame.TransitionSeconds);
+        var pillLeft = (width - pillWidth) / 2f;
+        var pillTop = (height - pillHeight) / 2f - 2f;
+        return new SKRect(pillLeft, pillTop, pillLeft + pillWidth, pillTop + pillHeight);
     }
 
     private void DrawPill(SKCanvas canvas, SKRect rect)
@@ -762,51 +879,148 @@ internal static class RendererDiagnostics
     }
 }
 
-internal static class NativeOverlay
+internal sealed class NativeOverlay : IDisposable
 {
     private const int ClientMessage = 33;
     private const long SubstructureNotifyMask = 1L << 19;
     private const long SubstructureRedirectMask = 1L << 20;
     private const int ShapeInput = 2;
+    private IntPtr _display;
+    private readonly IntPtr _window;
+    private readonly bool _clickThrough;
+    private PixelRect? _inputBounds;
+    private bool _inputConfigured;
+    private bool _shapeAvailable = true;
 
-    public static void TryConfigure(Window window, bool clickThrough)
+    private NativeOverlay(IntPtr display, IntPtr window, bool clickThrough)
+    {
+        _display = display;
+        _window = window;
+        _clickThrough = clickThrough;
+    }
+
+    public static NativeOverlay? TryCreate(Window window, bool clickThrough)
     {
         if (!OperatingSystem.IsLinux())
-            return;
+            return null;
         var handle = window.TryGetPlatformHandle();
         if (handle?.HandleDescriptor != "XID")
-            return;
+            return null;
 
         var display = IntPtr.Zero;
         try
         {
             display = XOpenDisplay(IntPtr.Zero);
             if (display == IntPtr.Zero)
-                return;
-
-            ShowOnAllWorkspaces(display, handle.Handle);
-            XFlush(display);
-
-            if (clickThrough)
-            {
-                var empty = XFixesCreateRegion(display, IntPtr.Zero, 0);
-                if (empty != IntPtr.Zero)
-                {
-                    XFixesSetWindowShapeRegion(display, handle.Handle, ShapeInput, 0, 0, empty);
-                    XFixesDestroyRegion(display, empty);
-                    XFlush(display);
-                }
-            }
+                return null;
+            return new NativeOverlay(display, handle.Handle, clickThrough);
         }
         catch (Exception exception) when (exception is DllNotFoundException or EntryPointNotFoundException)
         {
-            // The overlay remains usable; it just won't be click-through.
+            if (display != IntPtr.Zero)
+                XCloseDisplay(display);
+            return null;
+        }
+    }
+
+    public void SetInputRegion(Rect logicalBounds, double scaling)
+    {
+        if (_display == IntPtr.Zero || !_shapeAvailable)
+            return;
+
+        var bounds = PhysicalBounds(logicalBounds, scaling);
+        if (_inputConfigured && (_clickThrough || _inputBounds == bounds))
+            return;
+
+        var region = IntPtr.Zero;
+        try
+        {
+            if (_clickThrough)
+            {
+                region = XFixesCreateRegion(_display, IntPtr.Zero, 0);
+            }
+            else
+            {
+                var rows = CapsuleRows(bounds);
+                var rectangles = new XRectangle[rows.Length];
+                for (var i = 0; i < rows.Length; i++)
+                {
+                    rectangles[i] = new XRectangle
+                    {
+                        X = (short)Math.Clamp(rows[i].X, short.MinValue, short.MaxValue),
+                        Y = (short)Math.Clamp(rows[i].Y, short.MinValue, short.MaxValue),
+                        Width = (ushort)Math.Clamp(rows[i].Width, 0, ushort.MaxValue),
+                        Height = 1
+                    };
+                }
+                region = XFixesCreateRegionRectangles(_display, rectangles, rectangles.Length);
+            }
+
+            if (region == IntPtr.Zero)
+                return;
+            XFixesSetWindowShapeRegion(_display, _window, ShapeInput, 0, 0, region);
+            XFlush(_display);
+            _inputBounds = bounds;
+            _inputConfigured = true;
+        }
+        catch (Exception exception) when (exception is DllNotFoundException or EntryPointNotFoundException)
+        {
+            _shapeAvailable = false;
         }
         finally
         {
-            if (display != IntPtr.Zero)
-                XCloseDisplay(display);
+            if (region != IntPtr.Zero)
+                XFixesDestroyRegion(_display, region);
         }
+    }
+
+    public void RestoreWindowState()
+    {
+        if (_display == IntPtr.Zero)
+            return;
+        ShowOnAllWorkspaces(_display, _window);
+        XFlush(_display);
+        _inputConfigured = false;
+    }
+
+    internal static PixelRect[] CapsuleRows(PixelRect bounds)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return [];
+
+        var rows = new PixelRect[bounds.Height];
+        var radius = Math.Min(bounds.Width, bounds.Height) / 2d;
+        for (var row = 0; row < bounds.Height; row++)
+        {
+            var dy = Math.Abs(row + 0.5d - bounds.Height / 2d);
+            var dx = Math.Sqrt(Math.Max(0d, radius * radius - dy * dy));
+            var inset = Math.Max(0, (int)Math.Ceiling(radius - dx - 0.5d));
+            rows[row] = new PixelRect(
+                bounds.X + inset,
+                bounds.Y + row,
+                Math.Max(1, bounds.Width - inset * 2),
+                1);
+        }
+        return rows;
+    }
+
+    private static PixelRect PhysicalBounds(Rect bounds, double scaling)
+    {
+        if (!double.IsFinite(scaling) || scaling <= 0d)
+            scaling = 1d;
+        var left = (int)Math.Floor(bounds.Left * scaling);
+        var top = (int)Math.Floor(bounds.Top * scaling);
+        var right = (int)Math.Ceiling(bounds.Right * scaling);
+        var bottom = (int)Math.Ceiling(bounds.Bottom * scaling);
+        return new PixelRect(left, top, Math.Max(0, right - left), Math.Max(0, bottom - top));
+    }
+
+    public void Dispose()
+    {
+        if (_display == IntPtr.Zero)
+            return;
+        XCloseDisplay(_display);
+        _display = IntPtr.Zero;
     }
 
     private static void ShowOnAllWorkspaces(IntPtr display, IntPtr window)
@@ -815,11 +1029,15 @@ internal static class NativeOverlay
         var wmDesktop = XInternAtom(display, "_NET_WM_DESKTOP", 0);
         var wmState = XInternAtom(display, "_NET_WM_STATE", 0);
         var sticky = XInternAtom(display, "_NET_WM_STATE_STICKY", 0);
-        if (root == IntPtr.Zero || wmDesktop == IntPtr.Zero || wmState == IntPtr.Zero || sticky == IntPtr.Zero)
+        var above = XInternAtom(display, "_NET_WM_STATE_ABOVE", 0);
+        var skipTaskbar = XInternAtom(display, "_NET_WM_STATE_SKIP_TASKBAR", 0);
+        if (root == IntPtr.Zero || wmDesktop == IntPtr.Zero || wmState == IntPtr.Zero
+            || sticky == IntPtr.Zero || above == IntPtr.Zero || skipTaskbar == IntPtr.Zero)
             return;
 
         SendClientMessage(display, root, window, wmDesktop, uint.MaxValue, 1, 0, 0, 0);
-        SendClientMessage(display, root, window, wmState, 1, sticky.ToInt64(), 0, 1, 0);
+        SendClientMessage(display, root, window, wmState, 1, sticky.ToInt64(), above.ToInt64(), 1, 0);
+        SendClientMessage(display, root, window, wmState, 1, skipTaskbar.ToInt64(), 0, 1, 0);
     }
 
     private static void SendClientMessage(
@@ -872,6 +1090,15 @@ internal static class NativeOverlay
         public long Data4;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XRectangle
+    {
+        public short X;
+        public short Y;
+        public ushort Width;
+        public ushort Height;
+    }
+
     [DllImport("libX11.so.6")]
     private static extern IntPtr XOpenDisplay(IntPtr displayName);
     [DllImport("libX11.so.6")]
@@ -891,6 +1118,11 @@ internal static class NativeOverlay
         ref XClientMessageEvent eventSend);
     [DllImport("libXfixes.so.3")]
     private static extern IntPtr XFixesCreateRegion(IntPtr display, IntPtr rectangles, int count);
+    [DllImport("libXfixes.so.3", EntryPoint = "XFixesCreateRegion")]
+    private static extern IntPtr XFixesCreateRegionRectangles(
+        IntPtr display,
+        [In] XRectangle[] rectangles,
+        int count);
     [DllImport("libXfixes.so.3")]
     private static extern void XFixesSetWindowShapeRegion(IntPtr display, IntPtr window, int shapeKind, int x, int y, IntPtr region);
     [DllImport("libXfixes.so.3")]
