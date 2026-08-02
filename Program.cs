@@ -314,6 +314,11 @@ internal static class SelfCheck
         var line = track.Lyrics[0];
         var partial = IslandRenderer.ActiveWidth(line, 300, font);
         Require(partial > 0 && partial < font.MeasureText(line.Text), "syllable progress");
+        Require(IslandRenderer.HighlightAgeProgress(0) == 0f
+                && IslandRenderer.HighlightAgeProgress(650) is > 0.62f and < 0.64f
+                && IslandRenderer.HighlightAgeProgress(650.5) > IslandRenderer.HighlightAgeProgress(650)
+                && IslandRenderer.HighlightAgeProgress(2_000) > 0.95f,
+            "post-highlight lift timing");
         var reportedAt = Stopwatch.GetTimestamp();
         var previousPlayback = new PlaybackSnapshot(
             track, 10_000, reportedAt - Stopwatch.Frequency, true, "test");

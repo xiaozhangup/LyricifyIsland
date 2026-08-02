@@ -10,7 +10,7 @@ using Avalonia.Media;
 using Avalonia.Platform;
 using Avalonia.Rendering.SceneGraph;
 using Avalonia.Skia;
-using Avalonia.Threading;
+using Avalonia.VisualTree;
 using SkiaSharp;
 
 namespace LyricifyIsland;
@@ -158,7 +158,6 @@ public sealed class IslandControl : Control, IDisposable
 {
     private readonly PlaybackStore _store;
     private readonly IslandRenderer _renderer = new();
-    private readonly DispatcherTimer _timer;
     private TrackInfo? _track;
     private int _lineIndex = int.MinValue;
     private LyricLine? _line;
@@ -167,6 +166,8 @@ public sealed class IslandControl : Control, IDisposable
     private double _scale = 1d;
     private Rect _pillBounds;
     private PlaybackSnapshot? _renderedSnapshot;
+    private bool _animationFrameQueued;
+    private bool _disposed;
 
     internal Rect PillBounds => _pillBounds;
     internal event Action<Rect>? PillBoundsChanged;
@@ -174,14 +175,27 @@ public sealed class IslandControl : Control, IDisposable
     public IslandControl(PlaybackStore store)
     {
         _store = store;
-        _timer = new DispatcherTimer(TimeSpan.FromMilliseconds(1000d / 60d), DispatcherPriority.Render,
-            (_, _) =>
-            {
-                var snapshot = _store.Snapshot;
-                if (snapshot.IsPlaying || _outgoing is not null || !ReferenceEquals(snapshot, _renderedSnapshot))
-                    InvalidateVisual();
-            });
-        _timer.Start();
+        AttachedToVisualTree += (_, _) => QueueAnimationFrame();
+    }
+
+    private void QueueAnimationFrame()
+    {
+        if (_disposed || _animationFrameQueued || TopLevel.GetTopLevel(this) is not { } topLevel)
+            return;
+        _animationFrameQueued = true;
+        topLevel.RequestAnimationFrame(OnAnimationFrame);
+    }
+
+    private void OnAnimationFrame(TimeSpan _)
+    {
+        _animationFrameQueued = false;
+        if (_disposed || !this.IsAttachedToVisualTree())
+            return;
+
+        var snapshot = _store.Snapshot;
+        if (snapshot.IsPlaying || _outgoing is not null || !ReferenceEquals(snapshot, _renderedSnapshot))
+            InvalidateVisual();
+        QueueAnimationFrame();
     }
 
     public void SetScale(double scale)
@@ -248,16 +262,21 @@ public sealed class IslandControl : Control, IDisposable
         context.Custom(new IslandDrawOperation(new Rect(Bounds.Size), _renderer, frame, pillBounds));
     }
 
-    private static long CurrentPosition(PlaybackSnapshot snapshot)
+    private static double CurrentPosition(PlaybackSnapshot snapshot)
     {
         var elapsed = snapshot.IsPlaying
-            ? (long)Stopwatch.GetElapsedTime(snapshot.ReportedAtTimestamp).TotalMilliseconds
-            : 0L;
-        var offset = long.TryParse(Environment.GetEnvironmentVariable("LYRICIFY_OFFSET_MS"), out var value) ? value : 0L;
-        return Math.Clamp(snapshot.ReportedPositionMs + elapsed + offset, 0, snapshot.Track?.DurationMs ?? long.MaxValue);
+            ? Stopwatch.GetElapsedTime(snapshot.ReportedAtTimestamp).TotalMilliseconds
+            : 0d;
+        var offset = double.TryParse(
+            Environment.GetEnvironmentVariable("LYRICIFY_OFFSET_MS"),
+            CultureInfo.InvariantCulture,
+            out var value)
+            ? value
+            : 0d;
+        return Math.Clamp(snapshot.ReportedPositionMs + elapsed + offset, 0d, snapshot.Track?.DurationMs ?? double.MaxValue);
     }
 
-    internal static int FindLine(IReadOnlyList<LyricLine>? lines, long positionMs)
+    internal static int FindLine(IReadOnlyList<LyricLine>? lines, double positionMs)
     {
         if (lines is null || lines.Count == 0)
             return -1;
@@ -283,7 +302,7 @@ public sealed class IslandControl : Control, IDisposable
 
     public void Dispose()
     {
-        _timer.Stop();
+        _disposed = true;
         // Render operations may still be queued on Avalonia's compositor thread.
         // The process owns this renderer; releasing it here can race the final frame.
     }
@@ -314,7 +333,7 @@ internal sealed record IslandFrame(
     TrackInfo? Track,
     LyricLine? Line,
     LyricLine? Outgoing,
-    long PositionMs,
+    double PositionMs,
     bool IsPlaying,
     string? Status,
     double TransitionSeconds,
@@ -363,6 +382,10 @@ internal sealed class IslandRenderer : IDisposable
     private readonly SKBitmap? _icon;
     private TrackInfo? _albumTrack;
     private SKImage? _album;
+    private LyricLine? _layoutLine1;
+    private KaraokeLayout? _karaokeLayout1;
+    private LyricLine? _layoutLine2;
+    private KaraokeLayout? _karaokeLayout2;
 
     public IslandRenderer()
     {
@@ -520,7 +543,7 @@ internal sealed class IslandRenderer : IDisposable
     private void DrawLineBlock(
         SKCanvas canvas,
         LyricLine line,
-        long positionMs,
+        double positionMs,
         SKRect clip,
         MainFontSet mainFonts,
         SKFont translationFont,
@@ -530,7 +553,7 @@ internal sealed class IslandRenderer : IDisposable
         if (opacity <= 0.001f || scale <= 0.001f)
             return;
 
-        var layout = LayoutMainText(line.Text, mainFonts);
+        var layout = LayoutLine(line, mainFonts);
         var mainWidth = layout.Width;
         var translation = line.Translation ?? string.Empty;
         var hasTranslation = !string.IsNullOrWhiteSpace(translation);
@@ -545,7 +568,7 @@ internal sealed class IslandRenderer : IDisposable
 
         var mainX = centerX - mainWidth / 2f;
         var mainBaseline = hasTranslation ? originY - 5f : CenteredBaseline(originY, layout.Runs, mainFonts.Latin) - 2f;
-        DrawKaraokeText(canvas, line, positionMs, mainX, mainBaseline, layout.Runs, mainFonts, opacity);
+        DrawKaraokeText(canvas, line, positionMs, mainX, mainBaseline, layout, mainFonts, opacity);
 
         if (hasTranslation)
         {
@@ -558,50 +581,89 @@ internal sealed class IslandRenderer : IDisposable
     private void DrawKaraokeText(
         SKCanvas canvas,
         LyricLine line,
-        long positionMs,
+        double positionMs,
         float x,
         float baseline,
-        IReadOnlyList<MainTextRun> runs,
+        KaraokeLayout layout,
         MainFontSet fonts,
         float opacity)
     {
-        _idlePaint.Color = new SKColor(108, 109, 114, (byte)(225 * opacity));
-        DrawMainText(canvas, runs, x, baseline, _idlePaint);
-
         var activeWidth = ActiveWidth(line, positionMs, fonts);
+        _idlePaint.Color = new SKColor(108, 109, 114, (byte)(225 * opacity));
         if (activeWidth <= 0f)
+        {
+            DrawMainText(canvas, layout.Runs, x, baseline, _idlePaint);
             return;
+        }
 
         var activeRight = x + activeWidth;
-        canvas.Save();
-        canvas.ClipRect(new SKRect(x - 10f, baseline - 38f, activeRight + 5f, baseline + 11f));
+        foreach (var glyph in layout.Glyphs)
+        {
+            var visibleWidth = Math.Clamp(activeWidth - glyph.Offset, 0f, glyph.Width);
+            var liftProgress = HighlightAgeProgress(positionMs - glyph.StartMs);
+            var glowProgress = HighlightAgeProgress(positionMs - glyph.EndMs);
+            var glyphX = x + glyph.Offset;
+            var glyphBaseline = baseline - 4f * liftProgress;
+            if (visibleWidth < glyph.Width)
+            {
+                canvas.Save();
+                canvas.ClipRect(new SKRect(
+                    glyphX + visibleWidth, glyphBaseline - 38f,
+                    glyphX + glyph.Width + 1f, glyphBaseline + 11f));
+                canvas.Translate(glyphX, glyphBaseline);
+                canvas.DrawPath(glyph.Path, _idlePaint);
+                canvas.Restore();
+            }
+            if (visibleWidth <= 0f)
+                continue;
 
-        _wideGlow.Color = new SKColor(255, 255, 255, (byte)(42 * opacity));
-        DrawMainText(canvas, runs, x, baseline, _wideGlow);
-        _tightGlow.Color = new SKColor(255, 255, 255, (byte)(70 * opacity));
-        DrawMainText(canvas, runs, x, baseline, _tightGlow);
-        _corePaint.Color = new SKColor(247, 248, 249, (byte)(255 * opacity));
-        DrawMainText(canvas, runs, x, baseline, _corePaint);
-        canvas.Restore();
+            canvas.Save();
+            canvas.ClipRect(new SKRect(
+                glyphX - 10f, glyphBaseline - 39f,
+                glyphX + visibleWidth + 5f, glyphBaseline + 12f));
+            canvas.Translate(glyphX, glyphBaseline);
+            if (glowProgress > 0f)
+            {
+                _edgeBloom.Color = new SKColor(255, 255, 255, (byte)(51f * glowProgress * opacity));
+                canvas.DrawPath(glyph.Path, _edgeBloom);
+            }
+            _wideGlow.Color = new SKColor(255, 255, 255, (byte)(42 * opacity));
+            canvas.DrawPath(glyph.Path, _wideGlow);
+            _tightGlow.Color = new SKColor(255, 255, 255, (byte)(70 * opacity));
+            canvas.DrawPath(glyph.Path, _tightGlow);
+            _corePaint.Color = new SKColor(247, 248, 249, (byte)(255 * opacity));
+            canvas.DrawPath(glyph.Path, _corePaint);
+            canvas.Restore();
 
-        // A brighter, wider pass only around the moving edge produces the soft bloom in the reference.
-        canvas.Save();
-        canvas.ClipRect(new SKRect(activeRight - 10f, baseline - 39f, activeRight + 8f, baseline + 12f));
-        _edgeBloom.Color = new SKColor(255, 255, 255, (byte)(78 * opacity));
-        DrawMainText(canvas, runs, x, baseline, _edgeBloom);
-        canvas.Restore();
+            if (visibleWidth < glyph.Width)
+            {
+                // The reference keeps a brighter bloom around the moving highlight edge.
+                canvas.Save();
+                canvas.ClipRect(new SKRect(
+                    activeRight - 10f, glyphBaseline - 39f,
+                    activeRight + 8f, glyphBaseline + 12f));
+                canvas.Translate(glyphX, glyphBaseline);
+                _edgeBloom.Color = new SKColor(255, 255, 255, (byte)(78 * opacity));
+                canvas.DrawPath(glyph.Path, _edgeBloom);
+                canvas.Restore();
+            }
+        }
     }
 
-    internal static float ActiveWidth(LyricLine line, long positionMs, SKFont font) =>
+    internal static float HighlightAgeProgress(double ageMs) => ageMs <= 0d
+        ? 0f
+        : 1f - MathF.Exp((float)(-ageMs / 650d));
+
+    internal static float ActiveWidth(LyricLine line, double positionMs, SKFont font) =>
         ActiveWidth(line, positionMs, text => font.MeasureText(text));
 
-    private static float ActiveWidth(LyricLine line, long positionMs, MainFontSet fonts)
+    private static float ActiveWidth(LyricLine line, double positionMs, MainFontSet fonts)
     {
         var japanese = line.Text.EnumerateRunes().Any(IsKana);
         return ActiveWidth(line, positionMs, text => MeasureMainText(text, fonts, japanese));
     }
 
-    private static float ActiveWidth(LyricLine line, long positionMs, Func<string, float> measure)
+    private static float ActiveWidth(LyricLine line, double positionMs, Func<string, float> measure)
     {
         if (positionMs <= line.StartMs)
             return 0f;
@@ -697,6 +759,8 @@ internal sealed class IslandRenderer : IDisposable
     private static SKFont CreateFont(SKTypeface typeface, float size) => new(typeface, size)
     {
         Edging = SKFontEdging.Antialias,
+        Hinting = SKFontHinting.None,
+        LinearMetrics = true,
         Subpixel = true
     };
 
@@ -706,6 +770,96 @@ internal sealed class IslandRenderer : IDisposable
         Color = color,
         MaskFilter = blur > 0f ? SKMaskFilter.CreateBlur(SKBlurStyle.Normal, blur) : null
     };
+
+    private KaraokeLayout LayoutLine(LyricLine line, MainFontSet fonts)
+    {
+        if (ReferenceEquals(line, _layoutLine1))
+            return _karaokeLayout1!;
+        if (ReferenceEquals(line, _layoutLine2))
+            return _karaokeLayout2!;
+
+        _karaokeLayout2?.Dispose();
+        _layoutLine2 = _layoutLine1;
+        _karaokeLayout2 = _karaokeLayout1;
+        _layoutLine1 = line;
+        var (runs, width) = LayoutMainText(line.Text, fonts);
+        return _karaokeLayout1 = new KaraokeLayout(runs, BuildGlyphs(runs, line, width), width);
+    }
+
+    private static List<KaraokeGlyph> BuildGlyphs(List<MainTextRun> runs, LyricLine line, float lineWidth)
+    {
+        var glyphs = new List<KaraokeGlyph>();
+        var textOffset = 0;
+        foreach (var run in runs)
+        {
+            var runOffset = 0;
+            var previousWidth = 0f;
+            var elements = StringInfo.GetTextElementEnumerator(run.Text);
+            while (elements.MoveNext())
+            {
+                var text = elements.GetTextElement();
+                runOffset += text.Length;
+                var width = run.Font.MeasureText(run.Text.AsSpan(0, runOffset));
+                glyphs.Add(new KaraokeGlyph(
+                    run.Font.GetTextPath(text, SKPoint.Empty), run.Offset + previousWidth,
+                    Math.Max(0.001f, width - previousWidth), textOffset));
+                previousWidth = width;
+                textOffset += text.Length;
+            }
+        }
+
+        SetGlyphEndTimes(glyphs, line, lineWidth);
+        return glyphs;
+    }
+
+    private static void SetGlyphEndTimes(List<KaraokeGlyph> glyphs, LyricLine line, float lineWidth)
+    {
+        var syllableOffset = 0;
+        var glyphIndex = 0;
+        if (!line.Syllables.IsDefaultOrEmpty
+            && line.Syllables.Sum(syllable => syllable.Text.Length) == line.Text.Length)
+        {
+            foreach (var syllable in line.Syllables)
+            {
+                var first = glyphIndex;
+                var endOffset = syllableOffset + syllable.Text.Length;
+                while (glyphIndex < glyphs.Count && glyphs[glyphIndex].TextOffset < endOffset)
+                    glyphIndex++;
+                SetGlyphRangeEndTimes(glyphs, first, glyphIndex, syllable.StartMs, syllable.EndMs);
+                syllableOffset = endOffset;
+            }
+            return;
+        }
+
+        SetGlyphRangeEndTimes(glyphs, 0, glyphs.Count, line.StartMs, line.EndMs, lineWidth);
+    }
+
+    private static void SetGlyphRangeEndTimes(
+        List<KaraokeGlyph> glyphs,
+        int first,
+        int end,
+        long startMs,
+        long endMs,
+        float? knownWidth = null)
+    {
+        if (first >= end)
+            return;
+        var visualStart = glyphs[first].Offset;
+        var width = Math.Max(knownWidth
+            ?? glyphs[end - 1].Offset + glyphs[end - 1].Width - visualStart, 0.001f);
+        var duration = Math.Max(1L, endMs - startMs);
+        for (var i = first; i < end; i++)
+        {
+            var left = Math.Clamp((glyphs[i].Offset - visualStart) / width, 0f, 1f);
+            var right = Math.Clamp(
+                (glyphs[i].Offset + glyphs[i].Width - visualStart) / width, 0f, 1f);
+            glyphs[i].StartMs = startMs + duration * InverseSmoothStep(left);
+            glyphs[i].EndMs = startMs + duration * InverseSmoothStep(right);
+        }
+    }
+
+    private static double InverseSmoothStep(double value) =>
+        0.5d - Math.Sin(Math.Asin(1d - 2d * Math.Clamp(value, 0d, 1d)) / 3d);
 
     private static (List<MainTextRun> Runs, float Width) LayoutMainText(string text, MainFontSet fonts)
     {
@@ -846,6 +1000,8 @@ internal sealed class IslandRenderer : IDisposable
 
     public void Dispose()
     {
+        _karaokeLayout1?.Dispose();
+        _karaokeLayout2?.Dispose();
         _icon?.Dispose();
         _album?.Dispose();
         _latinFont.Dispose();
@@ -871,6 +1027,20 @@ internal sealed class IslandRenderer : IDisposable
         _japanese.Dispose();
     }
 
+    private sealed record KaraokeLayout(List<MainTextRun> Runs, List<KaraokeGlyph> Glyphs, float Width) : IDisposable
+    {
+        public void Dispose()
+        {
+            foreach (var glyph in Glyphs)
+                glyph.Path.Dispose();
+        }
+    }
+
+    private sealed record KaraokeGlyph(SKPath Path, float Offset, float Width, int TextOffset)
+    {
+        public double StartMs { get; set; }
+        public double EndMs { get; set; }
+    }
     private readonly record struct MainFontSet(SKFont Latin, SKFont Cjk, SKFont Japanese);
     private readonly record struct MainTextRun(string Text, SKFont Font, float Offset);
 }
