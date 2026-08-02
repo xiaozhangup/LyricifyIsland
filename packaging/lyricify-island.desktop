@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Lyricify Island
+Comment=Spotify desktop lyrics island
+Comment[zh_CN]=Spotify 桌面歌词岛
+Exec=LyricifyIsland
+Icon=lyricify-island
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=false
+StartupWMClass=LyricifyIsland

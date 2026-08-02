@@ -1,0 +1,6 @@
+.env
+.dotnet/
+bin/
+obj/
+dist/
+*.user
