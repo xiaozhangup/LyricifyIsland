@@ -1,5 +1,7 @@
 # Lyricify Island
 
+**该项目由 AI 编写**
+
 Linux 桌面顶置歌词岛。当前曲目和播放进度来自 Spotify Web API；逐字歌词与翻译通过
 [Lyricify Lyrics Helper](https://github.com/WXRIW/Lyricify-Lyrics-Helper) 获取和解析。
 字体、逐字裁剪、双层微光、播放头 bloom 与换行动画都在 Skia 自绘层完成，正常桌面运行时由 GPU 渲染。
