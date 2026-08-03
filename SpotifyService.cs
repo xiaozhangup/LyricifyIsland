@@ -19,11 +19,14 @@ internal sealed class SpotifyService
 
     private readonly PlaybackStore _store;
     private readonly Credentials _credentials;
+    private readonly SemaphoreSlim _pollWake = new(0);
     private TokenState? _tokens;
     private TrackInfo? _track;
     private TrackInfo? _loadingTrack;
     private CancellationTokenSource? _trackLoad;
     private long _lastPlaybackStateTimestamp;
+    private int _positionSyncVersion;
+    private int _positionSyncedVersion;
 
     public SpotifyService(PlaybackStore store, string clientId, string clientSecret)
     {
@@ -71,7 +74,15 @@ internal sealed class SpotifyService
 
             try
             {
-                await Task.Delay(delay, cancellationToken);
+                if (delay == PollInterval)
+                {
+                    _ = await _pollWake.WaitAsync(delay, cancellationToken);
+                    while (_pollWake.Wait(0)) { }
+                }
+                else
+                {
+                    await Task.Delay(delay, cancellationToken);
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -83,6 +94,10 @@ internal sealed class SpotifyService
 
     private async Task<TimeSpan> PollAsync(CancellationToken cancellationToken)
     {
+        var positionSyncVersion = Volatile.Read(ref _positionSyncVersion);
+        var forcePositionSync = positionSyncVersion != Volatile.Read(ref _positionSyncedVersion);
+        if (forcePositionSync)
+            _pollWake.Wait(0);
         var response = await SendCurrentTrackAsync(cancellationToken);
         if (response.StatusCode == HttpStatusCode.Unauthorized)
         {
@@ -121,7 +136,7 @@ internal sealed class SpotifyService
             var reportedPosition = GetNullableInt64(root, "progress_ms");
             var isPlaying = GetBoolean(root, "is_playing");
             var playbackStateTimestamp = GetInt64(root, "timestamp");
-            var samePlaybackState = playbackStateTimestamp != 0
+            var samePlaybackState = !forcePositionSync && playbackStateTimestamp != 0
                 && playbackStateTimestamp == _lastPlaybackStateTimestamp;
 
             if (!root.TryGetProperty("item", out var item) || item.ValueKind != JsonValueKind.Object)
@@ -148,6 +163,8 @@ internal sealed class SpotifyService
                 reportedAt,
                 isPlaying,
                 samePlaybackState);
+            if (forcePositionSync && reportedPosition.HasValue)
+                Volatile.Write(ref _positionSyncedVersion, positionSyncVersion);
             if (reportedPosition.HasValue && playbackStateTimestamp != 0)
                 _lastPlaybackStateTimestamp = playbackStateTimestamp;
 
@@ -199,7 +216,7 @@ internal sealed class SpotifyService
                 : Task.FromResult(placeholder.ArtistImageBytes);
             var detailsTask = Task.WhenAll(lyricsTask, albumTask);
 
-            void Publish(TrackInfo next)
+            bool Publish(TrackInfo next)
             {
                 next = next with
                 {
@@ -210,10 +227,11 @@ internal sealed class SpotifyService
                 };
                 if (next == published
                     || Interlocked.CompareExchange(ref _track, next, published) != published)
-                    return;
+                    return false;
                 Interlocked.CompareExchange(ref _loadingTrack, next, published);
                 published = next;
                 TrackCache.SaveIfChanged(next);
+                return true;
             }
 
             void PublishArtists(ImmutableArray<ImmutableArray<byte>> artists)
@@ -224,12 +242,18 @@ internal sealed class SpotifyService
 
             void PublishDetails(ImmutableArray<LyricLine> lyrics, ImmutableArray<byte> album)
             {
-                Publish(published with
+                var loadedLyrics = published.Lyrics.IsDefaultOrEmpty && !lyrics.IsDefaultOrEmpty;
+                var didPublish = Publish(published with
                 {
                     AlbumArtBytes = album.IsEmpty ? published.AlbumArtBytes : album,
                     Lyrics = lyrics.IsEmpty ? published.Lyrics : lyrics
                 });
                 Interlocked.CompareExchange(ref _loadingTrack, null, published);
+                if (loadedLyrics && didPublish)
+                {
+                    Interlocked.Increment(ref _positionSyncVersion);
+                    _pollWake.Release();
+                }
             }
 
             if (await Task.WhenAny(artistsTask, detailsTask) == artistsTask)

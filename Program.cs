@@ -343,6 +343,23 @@ internal static class SelfCheck
         Require(peak is > 1.15 and < 1.22, "spring overshoot");
         Require(Math.Abs(IslandRenderer.Spring(1) - 1) < 0.0001, "spring settles");
 
+        Require(IslandRenderer.AnimatedCapsuleProgress(1d, 0d, 0d) == 1d
+                && Math.Abs(IslandRenderer.AnimatedCapsuleProgress(
+                    1d, 0d, IslandRenderer.CapsuleTransitionDuration / 2d) - 0.5d) < 0.0001d
+                && IslandRenderer.AnimatedCapsuleProgress(
+                    1d, 0d, IslandRenderer.CapsuleTransitionDuration) == 0d
+                && IslandRenderer.AnimatedCapsuleProgress(0.4d, 1d, 0d) == 0.4d,
+            "capsule pause animation");
+        var fullCapsule = new Rect(100d, 20d, 400d, 90d);
+        var halfCapsule = IslandRenderer.ScalePillBounds(fullCapsule, 0.5d);
+        var hiddenCapsule = IslandRenderer.ScalePillBounds(fullCapsule, 0d);
+        Require(halfCapsule.Center == fullCapsule.Center
+                && halfCapsule.Width == 200d && halfCapsule.Height == 45d
+                && hiddenCapsule.Center == fullCapsule.Center
+                && hiddenCapsule.Width == 0d && hiddenCapsule.Height == 0d
+                && !IslandRenderer.HitTest(hiddenCapsule, hiddenCapsule.Center),
+            "capsule pause bounds");
+
         var icon = IslandRenderer.ArtistAvatarState(0, 3);
         var fadingIcon = IslandRenderer.ArtistAvatarState(1.1, 3);
         var blankAvatar = IslandRenderer.ArtistAvatarState(1.23, 3);
@@ -373,8 +390,8 @@ internal static class SelfCheck
                 previousPlayback, track.Id, 8_000, reportedAt, true, true) == 11_000,
             "stale playback position");
         Require(SpotifyService.StabilizePosition(
-                previousPlayback, track.Id, 9_400, reportedAt, true, false) == 9_400,
-            "playback seek");
+                previousPlayback, track.Id, 8_000, reportedAt, true, false) == 8_000,
+            "forced lyrics position resync");
         Require(SpotifyService.StabilizePosition(
                 previousPlayback, track.Id, null, reportedAt, true, true) == 11_000,
             "missing playback position");

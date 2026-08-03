@@ -163,6 +163,11 @@ public sealed class IslandControl : Control, IDisposable
     private LyricLine? _line;
     private LyricLine? _outgoing;
     private long _transitionAt;
+    private double _capsuleProgress = 1d;
+    private double _capsuleFrom = 1d;
+    private bool _capsuleShown = true;
+    private long _capsuleTransitionAt;
+    private bool _capsuleTransitioning;
     private double _scale = 1d;
     private Rect _pillBounds;
     private PlaybackSnapshot? _renderedSnapshot;
@@ -193,7 +198,8 @@ public sealed class IslandControl : Control, IDisposable
             return;
 
         var snapshot = _store.Snapshot;
-        if (snapshot.IsPlaying || _outgoing is not null || !ReferenceEquals(snapshot, _renderedSnapshot))
+        if (snapshot.IsPlaying || _outgoing is not null || _capsuleTransitioning
+            || !ReferenceEquals(snapshot, _renderedSnapshot))
             InvalidateVisual();
         QueueAnimationFrame();
     }
@@ -244,6 +250,21 @@ public sealed class IslandControl : Control, IDisposable
         if (transitionSeconds > IslandRenderer.TransitionDuration)
             _outgoing = null;
 
+        var capsuleShown = track is null || snapshot.IsPlaying;
+        var now = Stopwatch.GetTimestamp();
+        if (capsuleShown != _capsuleShown)
+        {
+            _capsuleShown = capsuleShown;
+            _capsuleFrom = _capsuleProgress;
+            _capsuleTransitionAt = now;
+        }
+        var capsuleSeconds = _capsuleTransitionAt == 0
+            ? IslandRenderer.CapsuleTransitionDuration
+            : Stopwatch.GetElapsedTime(_capsuleTransitionAt, now).TotalSeconds;
+        _capsuleProgress = IslandRenderer.AnimatedCapsuleProgress(
+            _capsuleFrom, capsuleShown ? 1d : 0d, capsuleSeconds);
+        _capsuleTransitioning = capsuleSeconds < IslandRenderer.CapsuleTransitionDuration;
+
         var frame = new IslandFrame(
             track,
             _line,
@@ -252,14 +273,17 @@ public sealed class IslandControl : Control, IDisposable
             snapshot.IsPlaying,
             snapshot.Status,
             transitionSeconds,
-            _scale);
-        var pillBounds = _renderer.CalculatePillBounds((float)Bounds.Width, (float)Bounds.Height, frame);
+            _scale,
+            _capsuleProgress);
+        var fullPillBounds = _renderer.CalculatePillBounds((float)Bounds.Width, (float)Bounds.Height, frame);
+        var pillBounds = IslandRenderer.ScalePillBounds(fullPillBounds, _capsuleProgress);
         if (pillBounds != _pillBounds)
         {
             _pillBounds = pillBounds;
             PillBoundsChanged?.Invoke(pillBounds);
         }
-        context.Custom(new IslandDrawOperation(new Rect(Bounds.Size), _renderer, frame, pillBounds));
+        context.Custom(new IslandDrawOperation(
+            new Rect(Bounds.Size), _renderer, frame, fullPillBounds, pillBounds));
     }
 
     private static double CurrentPosition(PlaybackSnapshot snapshot)
@@ -308,7 +332,12 @@ public sealed class IslandControl : Control, IDisposable
     }
 }
 
-internal sealed class IslandDrawOperation(Rect bounds, IslandRenderer renderer, IslandFrame frame, Rect pillBounds)
+internal sealed class IslandDrawOperation(
+    Rect bounds,
+    IslandRenderer renderer,
+    IslandFrame frame,
+    Rect fullPillBounds,
+    Rect pillBounds)
     : ICustomDrawOperation
 {
     public Rect Bounds { get; } = bounds;
@@ -321,7 +350,7 @@ internal sealed class IslandDrawOperation(Rect bounds, IslandRenderer renderer, 
 
         using var lease = feature.Lease();
         RendererDiagnostics.Observe(lease.GrContext is not null);
-        renderer.Draw(lease.SkCanvas, (float)Bounds.Width, (float)Bounds.Height, frame, pillBounds);
+        renderer.Draw(lease.SkCanvas, (float)Bounds.Width, (float)Bounds.Height, frame, fullPillBounds);
     }
 
     public bool HitTest(Point p) => IslandRenderer.HitTest(pillBounds, p);
@@ -337,11 +366,13 @@ internal sealed record IslandFrame(
     bool IsPlaying,
     string? Status,
     double TransitionSeconds,
-    double Scale);
+    double Scale,
+    double CapsuleProgress = 1d);
 
 internal sealed class IslandRenderer : IDisposable
 {
     public const double TransitionDuration = 0.9;
+    public const double CapsuleTransitionDuration = 0.38d;
     private const double ArtistAvatarDelay = 1.05d;
     private const double ArtistAvatarSlot = 3d;
     private const double ArtistAvatarFadeOut = 0.16d;
@@ -425,6 +456,15 @@ internal sealed class IslandRenderer : IDisposable
                 (float)(bounds.Right / visualScale),
                 (float)(bounds.Bottom / visualScale))
             : PillRect(width, height, frame, mainFonts, _translationFont);
+        var capsuleProgress = (float)Math.Clamp(frame.CapsuleProgress, 0d, 1d);
+        if (capsuleProgress <= 0f)
+        {
+            canvas.Restore();
+            return;
+        }
+        canvas.Translate(pillRect.MidX, pillRect.MidY);
+        canvas.Scale(capsuleProgress);
+        canvas.Translate(-pillRect.MidX, -pillRect.MidY);
         var pillHeight = pillRect.Height;
         var pillLeft = pillRect.Left;
         var pillTop = pillRect.Top;
@@ -483,7 +523,7 @@ internal sealed class IslandRenderer : IDisposable
 
     internal static bool HitTest(Rect pill, Point point)
     {
-        if (!pill.Contains(point))
+        if (pill.Width <= 0d || pill.Height <= 0d || !pill.Contains(point))
             return false;
 
         var radius = pill.Height / 2d;
@@ -493,6 +533,20 @@ internal sealed class IslandRenderer : IDisposable
         var dx = point.X - centerX;
         var dy = point.Y - pill.Center.Y;
         return dx * dx + dy * dy <= radius * radius;
+    }
+
+    internal static double AnimatedCapsuleProgress(double from, double to, double seconds)
+    {
+        var progress = SmoothStep(Math.Clamp(seconds / CapsuleTransitionDuration, 0d, 1d));
+        return from + (to - from) * progress;
+    }
+
+    internal static Rect ScalePillBounds(Rect bounds, double progress)
+    {
+        progress = Math.Clamp(progress, 0d, 1d);
+        var width = bounds.Width * progress;
+        var height = bounds.Height * progress;
+        return new Rect(bounds.Center.X - width / 2d, bounds.Center.Y - height / 2d, width, height);
     }
 
     private static SKRect PillRect(
@@ -1203,8 +1257,8 @@ internal sealed class NativeOverlay : IDisposable
         if (_display == IntPtr.Zero || !_shapeAvailable)
             return;
 
+        transparent |= _clickThrough || logicalBounds.Width <= 0d || logicalBounds.Height <= 0d;
         var bounds = PhysicalBounds(logicalBounds, scaling);
-        transparent |= _clickThrough;
         if (_inputConfigured && _inputTransparent == transparent && (transparent || _inputBounds == bounds))
             return;
 
