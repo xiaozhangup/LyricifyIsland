@@ -18,7 +18,10 @@ public sealed record TrackInfo(
     string Album,
     long DurationMs,
     ImmutableArray<byte> AlbumArtBytes,
-    ImmutableArray<LyricLine> Lyrics);
+    ImmutableArray<LyricLine> Lyrics)
+{
+    public ImmutableArray<ImmutableArray<byte>> ArtistImageBytes { get; init; } = [];
+}
 
 public sealed record PlaybackSnapshot(
     TrackInfo? Track,
@@ -31,6 +34,7 @@ internal sealed record SpotifyTrack(
     string Id,
     string Title,
     ImmutableArray<string> Artists,
+    ImmutableArray<string> ArtistIds,
     ImmutableArray<string> AlbumArtists,
     string Album,
     long DurationMs,

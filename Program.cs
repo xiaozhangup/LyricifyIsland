@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection;
+using System.Text.Json;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
@@ -85,7 +86,12 @@ public sealed class App : Application
     public override void Initialize()
     {
         RequestedThemeVariant = ThemeVariant.Dark;
-        Styles.Add(new FluentTheme());
+        var theme = new FluentTheme();
+        theme.Palettes[ThemeVariant.Dark] = new ColorPaletteResources
+        {
+            Accent = Avalonia.Media.Color.Parse("#1DB954")
+        };
+        Styles.Add(theme);
     }
 
     public override void OnFrameworkInitializationCompleted()
@@ -251,11 +257,19 @@ internal static class DemoSource
         return new TrackInfo(
             "demo",
             "Dream Rig",
-            ImmutableArray.Create("D4DJ All Mix"),
+            ImmutableArray.Create("Crystal Statues", "Crescent", "kerosene"),
             "D4DJ Groovy Mix Cover Tracks",
             19_000,
             DemoAlbum(),
-            lines);
+            lines)
+        {
+            ArtistImageBytes =
+            [
+                DemoAvatar("CS", new SKColor(73, 101, 126), new SKColor(205, 155, 130)),
+                DemoAvatar("CR", new SKColor(119, 68, 107), new SKColor(233, 166, 105)),
+                DemoAvatar("K", new SKColor(41, 95, 74), new SKColor(169, 204, 153))
+            ]
+        };
     }
 
     private static LyricLine Line(
@@ -289,6 +303,25 @@ internal static class DemoSource
         using var data = image.Encode(SKEncodedImageFormat.Png, 100);
         return data.ToArray().ToImmutableArray();
     }
+
+    private static ImmutableArray<byte> DemoAvatar(string initials, SKColor top, SKColor bottom)
+    {
+        using var surface = SKSurface.Create(new SKImageInfo(96, 96));
+        using var background = new SKPaint
+        {
+            Shader = SKShader.CreateLinearGradient(
+                new SKPoint(10, 0), new SKPoint(86, 96), [top, bottom],
+                (float[]?)null, SKShaderTileMode.Clamp)
+        };
+        surface.Canvas.DrawRect(new SKRect(0, 0, 96, 96), background);
+        using var font = new SKFont(SKTypeface.FromFamilyName("Montserrat", SKFontStyle.Bold), 31);
+        using var text = new SKPaint { IsAntialias = true, Color = new SKColor(255, 255, 255, 235) };
+        var width = font.MeasureText(initials);
+        surface.Canvas.DrawText(initials, 48f - width / 2f, 59f, font, text);
+        using var image = surface.Snapshot();
+        using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+        return data.ToArray().ToImmutableArray();
+    }
 }
 
 internal static class SelfCheck
@@ -309,6 +342,20 @@ internal static class SelfCheck
         var peak = Enumerable.Range(0, 101).Max(i => IslandRenderer.Spring(i / 100d));
         Require(peak is > 1.15 and < 1.22, "spring overshoot");
         Require(Math.Abs(IslandRenderer.Spring(1) - 1) < 0.0001, "spring settles");
+
+        var icon = IslandRenderer.ArtistAvatarState(0, 3);
+        var fadingIcon = IslandRenderer.ArtistAvatarState(1.1, 3);
+        var blankAvatar = IslandRenderer.ArtistAvatarState(1.23, 3);
+        var firstAvatar = IslandRenderer.ArtistAvatarState(1.6, 3);
+        var secondAvatar = IslandRenderer.ArtistAvatarState(4.6, 3);
+        var restoredIcon = IslandRenderer.ArtistAvatarState(10.6, 3);
+        Require(icon == (-1, 1f)
+                && fadingIcon.Index == -1 && fadingIcon.Opacity is > 0f and < 1f
+                && blankAvatar.Opacity == 0f
+                && firstAvatar == (0, 1f)
+                && secondAvatar == (1, 1f)
+                && restoredIcon == (-1, 1f),
+            "artist avatar carousel");
 
         using var font = new SKFont(SKTypeface.FromFamilyName("Noto Sans"), 32);
         var line = track.Lyrics[0];
@@ -398,6 +445,10 @@ internal static class SelfCheck
 
     private static void CheckTrackCache(TrackInfo track)
     {
+        var legacy = JsonSerializer.Deserialize<TrackInfo>(
+            """{"Id":"legacy","Title":"Legacy","Artists":[],"Album":"","DurationMs":1,"AlbumArtBytes":[],"Lyrics":[]}""");
+        Require(legacy is not null && legacy.ArtistImageBytes.IsEmpty, "legacy track cache");
+
         var previousCacheHome = Environment.GetEnvironmentVariable("XDG_CACHE_HOME");
         var cacheHome = Path.Combine(Path.GetTempPath(), $"lyricify-island-cache-test-{Guid.NewGuid():N}");
         try
@@ -408,6 +459,8 @@ internal static class SelfCheck
             Require(loaded is not null
                     && loaded.Title == track.Title
                     && loaded.AlbumArtBytes.SequenceEqual(track.AlbumArtBytes)
+                    && loaded.ArtistImageBytes.Length == track.ArtistImageBytes.Length
+                    && loaded.ArtistImageBytes[0].SequenceEqual(track.ArtistImageBytes[0])
                     && loaded.Lyrics.Length == track.Lyrics.Length
                     && loaded.Lyrics[0].Text == track.Lyrics[0].Text
                     && loaded.Lyrics[0].Syllables.Length == track.Lyrics[0].Syllables.Length,

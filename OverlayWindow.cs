@@ -342,6 +342,11 @@ internal sealed record IslandFrame(
 internal sealed class IslandRenderer : IDisposable
 {
     public const double TransitionDuration = 0.9;
+    private const double ArtistAvatarDelay = 1.05d;
+    private const double ArtistAvatarSlot = 3d;
+    private const double ArtistAvatarFadeOut = 0.16d;
+    private const double ArtistAvatarGap = 0.04d;
+    private const double ArtistAvatarFadeIn = 0.22d;
     private const float DoubleLinePillHeight = 90f;
     private const float SingleLinePillHeight = 68f;
     private const float MainSize = 32f;
@@ -382,6 +387,10 @@ internal sealed class IslandRenderer : IDisposable
     private readonly SKBitmap? _icon;
     private TrackInfo? _albumTrack;
     private SKImage? _album;
+    private readonly List<SKImage> _artistImages = [];
+    private TrackInfo? _artistTrack;
+    private string? _artistTrackId;
+    private long _artistTrackAt;
     private LyricLine? _layoutLine1;
     private KaraokeLayout? _karaokeLayout1;
     private LyricLine? _layoutLine2;
@@ -516,13 +525,13 @@ internal sealed class IslandRenderer : IDisposable
 
     private void DrawSides(SKCanvas canvas, IslandFrame frame, SKRect pill)
     {
-        var iconRect = SKRect.Create(pill.Left + 18f, pill.MidY - 21f, 42f, 42f);
-
-        if (_icon is not null)
-        {
-            canvas.DrawBitmap(_icon, iconRect, _iconGlow);
-            canvas.DrawBitmap(_icon, iconRect);
-        }
+        EnsureArtists(frame.Track);
+        var avatarRect = SKRect.Create(pill.Left + 18f, pill.MidY - 24f, 48f, 48f);
+        var avatarAge = _artistTrackAt == 0
+            ? 0d
+            : Stopwatch.GetElapsedTime(_artistTrackAt).TotalSeconds;
+        var avatar = ArtistAvatarState(avatarAge, _artistImages.Count);
+        DrawAvatar(canvas, avatarRect, avatar.Index, avatar.Opacity);
 
         EnsureAlbum(frame.Track);
         var albumRect = SKRect.Create(pill.Right - 62f, pill.MidY - 22f, 44f, 44f);
@@ -538,6 +547,57 @@ internal sealed class IslandRenderer : IDisposable
             canvas.DrawRect(albumRect, _placeholderPaint);
         }
         canvas.Restore();
+    }
+
+    private void DrawAvatar(SKCanvas canvas, SKRect rect, int index, float opacity)
+    {
+        if (opacity <= 0.001f)
+            return;
+
+        var alpha = (byte)Math.Round(255f * opacity);
+        _imagePaint.Color = new SKColor(255, 255, 255, alpha);
+        if (index < 0)
+        {
+            if (_icon is not null)
+            {
+                _iconGlow.Color = new SKColor(35, 255, 110, (byte)Math.Round(95f * opacity));
+                canvas.DrawBitmap(_icon, rect, _iconGlow);
+                canvas.DrawBitmap(_icon, rect, _imagePaint);
+            }
+        }
+        else if (index < _artistImages.Count)
+        {
+            canvas.Save();
+            canvas.ClipRoundRect(
+                new SKRoundRect(rect, rect.Width / 2f), SKClipOperation.Intersect, true);
+            canvas.DrawImage(_artistImages[index], rect,
+                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear), _imagePaint);
+            canvas.Restore();
+        }
+        _imagePaint.Color = SKColors.White;
+    }
+
+    internal static (int Index, float Opacity) ArtistAvatarState(double trackAge, int artistCount)
+    {
+        if (artistCount <= 0 || trackAge < ArtistAvatarDelay)
+            return (-1, 1f);
+
+        var elapsed = trackAge - ArtistAvatarDelay;
+        var slot = (int)(elapsed / ArtistAvatarSlot);
+        if (slot > artistCount)
+            return (-1, 1f);
+
+        var local = elapsed - slot * ArtistAvatarSlot;
+        var from = slot - 1;
+        var to = slot < artistCount ? slot : -1;
+        if (local < ArtistAvatarFadeOut)
+            return (from, 1f - (float)EaseInCubic(local / ArtistAvatarFadeOut));
+        if (local < ArtistAvatarFadeOut + ArtistAvatarGap)
+            return (-1, 0f);
+        if (local < ArtistAvatarFadeOut + ArtistAvatarGap + ArtistAvatarFadeIn)
+            return (to, (float)EaseOutCubic(
+                (local - ArtistAvatarFadeOut - ArtistAvatarGap) / ArtistAvatarFadeIn));
+        return (to, 1f);
     }
 
     private void DrawLineBlock(
@@ -979,6 +1039,43 @@ internal sealed class IslandRenderer : IDisposable
             : null;
     }
 
+    private void EnsureArtists(TrackInfo? track)
+    {
+        var now = Stopwatch.GetTimestamp();
+        if (track?.Id != _artistTrackId)
+        {
+            _artistTrackId = track?.Id;
+            _artistTrackAt = track is null ? 0 : now;
+            _artistTrack = null;
+            ClearArtists();
+        }
+        if (ReferenceEquals(_artistTrack, track))
+            return;
+
+        _artistTrack = track;
+        var hadImages = _artistImages.Count > 0;
+        ClearArtists();
+        if (track is not null && !track.ArtistImageBytes.IsDefaultOrEmpty)
+        {
+            foreach (var bytes in track.ArtistImageBytes)
+            {
+                if (!bytes.IsDefaultOrEmpty && SKImage.FromEncodedData(bytes.AsSpan()) is { } image)
+                    _artistImages.Add(image);
+            }
+        }
+
+        if (!hadImages && _artistImages.Count > 0 && _artistTrackAt != 0
+            && Stopwatch.GetElapsedTime(_artistTrackAt, now).TotalSeconds > ArtistAvatarDelay)
+            _artistTrackAt = now - (long)(ArtistAvatarDelay * Stopwatch.Frequency);
+    }
+
+    private void ClearArtists()
+    {
+        foreach (var image in _artistImages)
+            image.Dispose();
+        _artistImages.Clear();
+    }
+
     internal static double Spring(double p)
     {
         p = Math.Clamp(p, 0d, 1d);
@@ -1004,6 +1101,7 @@ internal sealed class IslandRenderer : IDisposable
         _karaokeLayout2?.Dispose();
         _icon?.Dispose();
         _album?.Dispose();
+        ClearArtists();
         _latinFont.Dispose();
         _cjkFont.Dispose();
         _japaneseFont.Dispose();

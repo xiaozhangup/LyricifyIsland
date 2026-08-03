@@ -189,24 +189,62 @@ internal sealed class SpotifyService
         TrackInfo placeholder,
         CancellationToken cancellationToken)
     {
+        var published = placeholder;
         try
         {
             var lyricsTask = LoadLyricsSafeAsync(spotifyTrack, cancellationToken);
-            var albumTask = LoadAlbumArtSafeAsync(spotifyTrack.AlbumArtUrl, cancellationToken);
-            await Task.WhenAll(lyricsTask, albumTask);
-            var lyrics = await lyricsTask;
-            var album = await albumTask;
-            var loaded = new TrackInfo(
-                spotifyTrack.Id,
-                spotifyTrack.Title,
-                spotifyTrack.Artists,
-                spotifyTrack.Album,
-                spotifyTrack.DurationMs,
-                album.IsEmpty ? placeholder.AlbumArtBytes : album,
-                lyrics.IsEmpty ? placeholder.Lyrics : lyrics);
-            TrackCache.SaveIfChanged(loaded);
-            if (Interlocked.CompareExchange(ref _track, loaded, placeholder) == placeholder)
-                Interlocked.CompareExchange(ref _loadingTrack, null, placeholder);
+            var albumTask = LoadImageSafeAsync(spotifyTrack.AlbumArtUrl, cancellationToken);
+            var artistsTask = placeholder.ArtistImageBytes.IsDefaultOrEmpty
+                ? LoadArtistImagesSafeAsync(spotifyTrack.ArtistIds, cancellationToken)
+                : Task.FromResult(placeholder.ArtistImageBytes);
+            var detailsTask = Task.WhenAll(lyricsTask, albumTask);
+
+            void Publish(TrackInfo next)
+            {
+                next = next with
+                {
+                    Title = spotifyTrack.Title,
+                    Artists = spotifyTrack.Artists,
+                    Album = spotifyTrack.Album,
+                    DurationMs = spotifyTrack.DurationMs
+                };
+                if (next == published
+                    || Interlocked.CompareExchange(ref _track, next, published) != published)
+                    return;
+                Interlocked.CompareExchange(ref _loadingTrack, next, published);
+                published = next;
+                TrackCache.SaveIfChanged(next);
+            }
+
+            void PublishArtists(ImmutableArray<ImmutableArray<byte>> artists)
+            {
+                if (!artists.IsDefaultOrEmpty && !artists.Equals(published.ArtistImageBytes))
+                    Publish(published with { ArtistImageBytes = artists });
+            }
+
+            void PublishDetails(ImmutableArray<LyricLine> lyrics, ImmutableArray<byte> album)
+            {
+                Publish(published with
+                {
+                    AlbumArtBytes = album.IsEmpty ? published.AlbumArtBytes : album,
+                    Lyrics = lyrics.IsEmpty ? published.Lyrics : lyrics
+                });
+                Interlocked.CompareExchange(ref _loadingTrack, null, published);
+            }
+
+            if (await Task.WhenAny(artistsTask, detailsTask) == artistsTask)
+            {
+                PublishArtists(await artistsTask);
+                await detailsTask;
+                PublishDetails(await lyricsTask, await albumTask);
+            }
+            else
+            {
+                await detailsTask;
+                PublishDetails(await lyricsTask, await albumTask);
+                PublishArtists(await artistsTask);
+            }
+            Interlocked.CompareExchange(ref _loadingTrack, null, published);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -214,7 +252,7 @@ internal sealed class SpotifyService
         catch (Exception exception)
         {
             Console.Error.WriteLine($"[track] load failed: {Friendly(exception)}");
-            Interlocked.CompareExchange(ref _loadingTrack, null, placeholder);
+            Interlocked.CompareExchange(ref _loadingTrack, null, published);
         }
     }
 
@@ -460,6 +498,7 @@ internal sealed class SpotifyService
 
         var duration = GetInt64(item, "duration_ms");
         var artists = Names(item, "artists");
+        var artistIds = Values(item, "artists", "id");
         var albumName = string.Empty;
         var albumArtists = ImmutableArray<string>.Empty;
         string? albumArtUrl = null;
@@ -478,23 +517,26 @@ internal sealed class SpotifyService
         var id = GetString(item, "id") ?? GetString(item, "uri")
             ?? $"local:{title}:{duration}:{string.Join(',', artists)}";
         return new SpotifyTrack(
-            id, title, artists, albumArtists, albumName, duration, isrc, albumArtUrl);
+            id, title, artists, artistIds, albumArtists, albumName, duration, isrc, albumArtUrl);
     }
 
     private static ImmutableArray<string> Names(JsonElement parent, string property)
+        => Values(parent, property, "name");
+
+    private static ImmutableArray<string> Values(JsonElement parent, string property, string field)
     {
         if (!parent.TryGetProperty(property, out var array) || array.ValueKind != JsonValueKind.Array)
             return ImmutableArray<string>.Empty;
         return array.EnumerateArray()
-            .Select(value => GetString(value, "name"))
-            .Where(name => !string.IsNullOrWhiteSpace(name))
-            .Select(name => name!)
+            .Select(value => GetString(value, field))
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value!)
             .ToImmutableArray();
     }
 
-    private static string? SmallestImage(JsonElement album)
+    private static string? SmallestImage(JsonElement parent)
     {
-        if (!album.TryGetProperty("images", out var images) || images.ValueKind != JsonValueKind.Array)
+        if (!parent.TryGetProperty("images", out var images) || images.ValueKind != JsonValueKind.Array)
             return null;
 
         string? smallest = null;
@@ -534,7 +576,50 @@ internal sealed class SpotifyService
         }
     }
 
-    private static async Task<ImmutableArray<byte>> LoadAlbumArtSafeAsync(
+    private async Task<ImmutableArray<ImmutableArray<byte>>> LoadArtistImagesSafeAsync(
+        ImmutableArray<string> artistIds,
+        CancellationToken cancellationToken)
+    {
+        if (artistIds.IsDefaultOrEmpty)
+            return [];
+        var images = await Task.WhenAll(artistIds.Select(id =>
+            LoadArtistImageSafeAsync(id, cancellationToken)));
+        return images.Where(image => !image.IsDefaultOrEmpty).ToImmutableArray();
+    }
+
+    private async Task<ImmutableArray<byte>> LoadArtistImageSafeAsync(
+        string artistId,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                $"https://api.spotify.com/v1/artists/{Uri.EscapeDataString(artistId)}");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _tokens!.AccessToken);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            using var response = await Http.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+            if (!response.IsSuccessStatusCode)
+                return ImmutableArray<byte>.Empty;
+
+            await using var body = await response.Content.ReadAsStreamAsync(timeout.Token);
+            using var json = await JsonDocument.ParseAsync(body, cancellationToken: timeout.Token);
+            return await LoadImageSafeAsync(SmallestImage(json.RootElement), timeout.Token);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return ImmutableArray<byte>.Empty;
+        }
+    }
+
+    private static async Task<ImmutableArray<byte>> LoadImageSafeAsync(
         string? url,
         CancellationToken cancellationToken)
     {
