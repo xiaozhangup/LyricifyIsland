@@ -15,6 +15,7 @@ internal sealed class SpotifyService
     private const string Scope = "user-read-currently-playing user-read-playback-state";
     private const string CurrentlyPlayingUrl = "https://api.spotify.com/v1/me/player/currently-playing?additional_types=track";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(750);
+    private const long CrossfadeTransitionSlackMs = 1_500;
     private static readonly HttpClient Http = new();
 
     private readonly PlaybackStore _store;
@@ -25,6 +26,7 @@ internal sealed class SpotifyService
     private TrackInfo? _loadingTrack;
     private CancellationTokenSource? _trackLoad;
     private long _lastPlaybackStateTimestamp;
+    private long _crossfadeOffsetMs;
     private int _positionSyncVersion;
     private int _positionSyncedVersion;
 
@@ -136,6 +138,9 @@ internal sealed class SpotifyService
             var reportedPosition = GetNullableInt64(root, "progress_ms");
             var isPlaying = GetBoolean(root, "is_playing");
             var playbackStateTimestamp = GetInt64(root, "timestamp");
+            var playbackStateChanged = playbackStateTimestamp != 0
+                && _lastPlaybackStateTimestamp != 0
+                && playbackStateTimestamp != _lastPlaybackStateTimestamp;
             var samePlaybackState = !forcePositionSync && playbackStateTimestamp != 0
                 && playbackStateTimestamp == _lastPlaybackStateTimestamp;
 
@@ -156,8 +161,16 @@ internal sealed class SpotifyService
                 return PollInterval;
             }
 
+            var previous = _store.Snapshot;
+            reportedPosition = ApplyCrossfadeOffset(
+                previous,
+                spotifyTrack.Id,
+                reportedPosition,
+                reportedAt,
+                isPlaying,
+                playbackStateChanged);
             var position = StabilizePosition(
-                _store.Snapshot,
+                previous,
                 spotifyTrack.Id,
                 reportedPosition,
                 reportedAt,
@@ -284,6 +297,96 @@ internal sealed class SpotifyService
     {
         CancelTrackLoad();
         Volatile.Write(ref _track, null);
+        _crossfadeOffsetMs = 0;
+    }
+
+    private long? ApplyCrossfadeOffset(
+        PlaybackSnapshot previous,
+        string trackId,
+        long? reportedPosition,
+        long reportedAt,
+        bool isPlaying,
+        bool playbackStateChanged)
+    {
+        if (previous.Track?.Id != trackId)
+        {
+            var crossfadeMs = ReadSpotifyCrossfadeMs();
+            _crossfadeOffsetMs = IsAutomaticCrossfadeTransition(
+                previous, reportedAt, isPlaying, crossfadeMs)
+                    ? crossfadeMs
+                    : 0;
+        }
+        else if (!isPlaying || !previous.IsPlaying || playbackStateChanged)
+        {
+            _crossfadeOffsetMs = 0;
+        }
+
+        return reportedPosition.HasValue
+            ? Math.Max(0, reportedPosition.Value - _crossfadeOffsetMs)
+            : null;
+    }
+
+    internal static bool IsAutomaticCrossfadeTransition(
+        PlaybackSnapshot previous,
+        long reportedAt,
+        bool isPlaying,
+        long crossfadeMs)
+    {
+        if (crossfadeMs <= 0 || !isPlaying || !previous.IsPlaying || previous.Track is null)
+            return false;
+
+        var elapsed = Math.Max(0L,
+            (long)Stopwatch.GetElapsedTime(previous.ReportedAtTimestamp, reportedAt).TotalMilliseconds);
+        return previous.ReportedPositionMs + elapsed
+            >= previous.Track.DurationMs - crossfadeMs - CrossfadeTransitionSlackMs;
+    }
+
+    internal static int ParseSpotifyCrossfadeMs(string preferences)
+    {
+        var enabled = false;
+        var duration = 0;
+        using var reader = new StringReader(preferences);
+        while (reader.ReadLine() is { } line)
+        {
+            var separator = line.IndexOf('=');
+            if (separator < 0)
+                continue;
+            var key = line[..separator].Trim();
+            var value = line[(separator + 1)..].Trim();
+            if (key == "audio.crossfade_v2")
+                enabled = bool.TryParse(value, out var parsed) && parsed;
+            else if (key == "audio.crossfade.time_v2")
+                int.TryParse(value, out duration);
+        }
+        return enabled ? Math.Clamp(duration, 0, 12_000) : 0;
+    }
+
+    private static int ReadSpotifyCrossfadeMs()
+    {
+        var configHome = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME");
+        if (string.IsNullOrWhiteSpace(configHome) || !Path.IsPathRooted(configHome))
+            configHome = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config");
+        var users = Path.Combine(configHome, "spotify", "Users");
+        if (!Directory.Exists(users))
+            return 0;
+
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(users, "prefs", SearchOption.AllDirectories))
+            {
+                var crossfadeMs = ParseSpotifyCrossfadeMs(File.ReadAllText(path));
+                if (crossfadeMs > 0)
+                    return crossfadeMs;
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+        return 0;
     }
 
     internal static long StabilizePosition(

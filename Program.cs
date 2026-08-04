@@ -395,6 +395,20 @@ internal static class SelfCheck
         Require(SpotifyService.StabilizePosition(
                 previousPlayback, track.Id, null, reportedAt, true, true) == 11_000,
             "missing playback position");
+        var nearTrackEnd = previousPlayback with
+        {
+            ReportedPositionMs = track.DurationMs - 4_000,
+            ReportedAtTimestamp = reportedAt - Stopwatch.Frequency
+        };
+        Require(SpotifyService.ParseSpotifyCrossfadeMs(
+                    "audio.crossfade_v2=true\naudio.crossfade.time_v2=3000\n") == 3_000
+                && SpotifyService.ParseSpotifyCrossfadeMs(
+                    "audio.crossfade_v2=false\naudio.crossfade.time_v2=3000\n") == 0
+                && SpotifyService.IsAutomaticCrossfadeTransition(
+                    nearTrackEnd, reportedAt, true, 3_000)
+                && !SpotifyService.IsAutomaticCrossfadeTransition(
+                    previousPlayback, reportedAt, true, 3_000),
+            "Spotify crossfade transition compensation");
         Require(SettingsStore.NormalizeWidthPercent(double.NaN) == 70d, "invalid width setting");
         Require(SettingsStore.NormalizeWidthPercent(12d) == 40d, "minimum width setting");
         Require(SettingsStore.NormalizeWidthPercent(120d) == 100d, "maximum width setting");
