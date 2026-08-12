@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="LyricifyIsland.csproj" />
+  <Project Path="vendor/Lyricify-Lyrics-Helper/Lyricify.Lyrics.Helper/Lyricify.Lyrics.Helper.csproj" />
+</Solution>

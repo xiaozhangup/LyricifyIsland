@@ -1,5 +1,7 @@
 .env
 .dotnet/
+.idea/
+.codex/
 bin/
 obj/
 dist/
