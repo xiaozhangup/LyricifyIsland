@@ -114,7 +114,7 @@ internal sealed class SpotifyService
             {
                 ClearTrack();
                 _store.Update(new PlaybackSnapshot(
-                    null, 0, Stopwatch.GetTimestamp(), false, "Spotify 当前没有播放"));
+                    null, 0, Stopwatch.GetTimestamp(), false, PlaybackStore.NoActiveSpotifyPlaybackStatus));
                 return PollInterval;
             }
 
@@ -148,7 +148,7 @@ internal sealed class SpotifyService
             {
                 ClearTrack();
                 _store.Update(new PlaybackSnapshot(
-                    null, 0, reportedAt, false, "Spotify 当前没有播放"));
+                    null, 0, reportedAt, false, PlaybackStore.NoActiveSpotifyPlaybackStatus));
                 return PollInterval;
             }
 

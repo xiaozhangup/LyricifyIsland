@@ -10,6 +10,7 @@ using Avalonia.Media;
 using Avalonia.Platform;
 using Avalonia.Rendering.SceneGraph;
 using Avalonia.Skia;
+using Avalonia.Threading;
 using Avalonia.VisualTree;
 using SkiaSharp;
 
@@ -19,15 +20,23 @@ public sealed class OverlayWindow : Window
 {
     private const double BaseHeight = 116d;
     private readonly IslandControl _island;
+    private readonly Action<PixelPoint> _positionChanged;
+    private readonly MenuItem _hideItem;
+    private readonly DispatcherTimer _positionSaveTimer;
     private IslandSettings _settings;
     private NativeOverlay? _nativeOverlay;
     private bool _opened;
     private bool _closed;
     private bool _temporarilyHidden;
 
-    internal OverlayWindow(PlaybackStore store, IslandSettings settings, Action exit)
+    internal OverlayWindow(
+        PlaybackStore store,
+        IslandSettings settings,
+        Action<PixelPoint> positionChanged,
+        Action exit)
     {
         _settings = SettingsStore.Normalize(settings);
+        _positionChanged = positionChanged;
         Width = 960;
         Height = CalculateLogicalHeight(_settings.ScalePercent);
         Background = Brushes.Transparent;
@@ -41,7 +50,7 @@ public sealed class OverlayWindow : Window
         ExtendClientAreaToDecorationsHint = true;
 
         _island = new IslandControl(store);
-        _island.SetScale(_settings.ScalePercent / 100d);
+        _island.ApplySettings(_settings);
         _island.PillBoundsChanged += bounds =>
             _nativeOverlay?.SetInputRegion(bounds, RenderScaling, _temporarilyHidden);
         _island.PointerPressed += (_, args) =>
@@ -51,33 +60,46 @@ public sealed class OverlayWindow : Window
             if (args.ClickCount == 2)
             {
                 args.Handled = true;
-                _ = HideForTwoSecondsAsync();
+                _ = HideTemporarilyAsync();
             }
-            else
+            else if (!_settings.LockPosition)
             {
                 BeginMoveDrag(args);
             }
         };
 
-        var hide = new MenuItem { Header = "隐藏2s" };
-        hide.Click += (_, _) => _ = HideForTwoSecondsAsync();
+        _hideItem = new MenuItem { Header = HideLabel(_settings.TemporaryHideSeconds) };
+        _hideItem.Click += (_, _) => _ = HideTemporarilyAsync();
         var center = new MenuItem { Header = "居中" };
         center.Click += (_, _) => CenterHorizontally();
         var exitItem = new MenuItem { Header = "退出" };
         exitItem.Click += (_, _) => exit();
-        _island.ContextMenu = new ContextMenu { ItemsSource = new[] { hide, center, exitItem } };
+        _island.ContextMenu = new ContextMenu { ItemsSource = new[] { _hideItem, center, exitItem } };
         Content = _island;
+
+        _positionSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
+        _positionSaveTimer.Tick += (_, _) =>
+        {
+            _positionSaveTimer.Stop();
+            if (!_closed && _settings.RememberPosition)
+                _positionChanged(Position);
+        };
+        PositionChanged += (_, _) =>
+        {
+            if (!_opened || !_settings.RememberPosition)
+                return;
+            _positionSaveTimer.Stop();
+            _positionSaveTimer.Start();
+        };
 
         Opened += (_, _) =>
         {
             if (!_opened)
             {
                 _opened = true;
-                ApplyGeometry();
+                ApplyGeometry(useRememberedPosition: true);
                 Screens.Changed += ScreensChanged;
-                _nativeOverlay = NativeOverlay.TryCreate(
-                    this,
-                    Environment.GetEnvironmentVariable("LYRICIFY_CLICK_THROUGH") == "1");
+                _nativeOverlay = NativeOverlay.TryCreate(this, _settings.ClickThrough);
             }
             _nativeOverlay?.RestoreWindowState();
             _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling, _temporarilyHidden);
@@ -85,6 +107,7 @@ public sealed class OverlayWindow : Window
         Closed += (_, _) =>
         {
             _closed = true;
+            _positionSaveTimer.Stop();
             Screens.Changed -= ScreensChanged;
             _nativeOverlay?.Dispose();
             _island.Dispose();
@@ -93,11 +116,25 @@ public sealed class OverlayWindow : Window
 
     internal void ApplySettings(IslandSettings settings)
     {
+        var previous = _settings;
         _settings = SettingsStore.Normalize(settings);
         Height = CalculateLogicalHeight(_settings.ScalePercent);
-        _island.SetScale(_settings.ScalePercent / 100d);
-        if (IsVisible)
-            ApplyGeometry();
+        _island.ApplySettings(_settings);
+        _hideItem.Header = HideLabel(_settings.TemporaryHideSeconds);
+        _nativeOverlay?.SetClickThrough(_settings.ClickThrough);
+        _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling, _temporarilyHidden);
+        var geometryChanged = previous.WidthPercent != _settings.WidthPercent
+            || previous.ScalePercent != _settings.ScalePercent
+            || previous.DisplayId != _settings.DisplayId
+            || previous.TopOffset != _settings.TopOffset
+            || previous.RememberPosition != _settings.RememberPosition;
+        if (IsVisible && geometryChanged)
+        {
+            var resetPosition = previous.DisplayId != _settings.DisplayId
+                || previous.TopOffset != _settings.TopOffset
+                || previous.RememberPosition && !_settings.RememberPosition;
+            ApplyGeometry(keepCurrentCenter: !resetPosition);
+        }
     }
 
     internal static double CalculateLogicalWidth(int physicalWidth, double scaling, double percent)
@@ -110,16 +147,16 @@ public sealed class OverlayWindow : Window
     internal static double CalculateLogicalHeight(double scalePercent) =>
         BaseHeight * SettingsStore.NormalizeScalePercent(scalePercent) / 100d;
 
-    private void ScreensChanged(object? sender, EventArgs args) => ApplyGeometry();
+    private void ScreensChanged(object? sender, EventArgs args) => ApplyGeometry(useRememberedPosition: true);
 
-    private async Task HideForTwoSecondsAsync()
+    private async Task HideTemporarilyAsync()
     {
         if (_temporarilyHidden)
             return;
         _temporarilyHidden = true;
         Opacity = 0;
         _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling, transparent: true);
-        await Task.Delay(TimeSpan.FromSeconds(2));
+        await Task.Delay(TimeSpan.FromSeconds(_settings.TemporaryHideSeconds));
         if (!_closed)
         {
             _temporarilyHidden = false;
@@ -138,19 +175,46 @@ public sealed class OverlayWindow : Window
     internal static PixelPoint CenteredHorizontally(PixelPoint position, PixelRect area, int width) =>
         new(area.X + (area.Width - width) / 2, position.Y);
 
-    private void ApplyGeometry()
+    internal static string ScreenId(Screen screen) =>
+        $"{screen.DisplayName ?? "display"}|{screen.Bounds.X},{screen.Bounds.Y},{screen.Bounds.Width},{screen.Bounds.Height}";
+
+    internal static PixelPoint ClampPosition(PixelPoint position, PixelRect area, int width, int height) => new(
+        Math.Clamp(position.X, area.X, Math.Max(area.X, area.X + area.Width - width)),
+        Math.Clamp(position.Y, area.Y, Math.Max(area.Y, area.Y + area.Height - height)));
+
+    private static string HideLabel(int seconds) => $"隐藏 {seconds} 秒";
+
+    private void ApplyGeometry(bool useRememberedPosition = false, bool keepCurrentCenter = false)
     {
-        var screen = Screens.Primary ?? Screens.All.First();
+        var remembered = _settings.RememberPosition && _settings.WindowX is { } x && _settings.WindowY is { } y
+            ? new PixelPoint?(new PixelPoint(x, y))
+            : null;
+        var screen = keepCurrentCenter
+            ? Screens.ScreenFromWindow(this)
+            : PreferredScreen(remembered, useRememberedPosition);
+        screen ??= Screens.Primary ?? Screens.All.First();
         var area = screen.WorkingArea;
-        var physicalWidth = (int)Math.Round(
-            area.Width * _settings.WidthPercent / 100d);
+        var previousPhysicalWidth = (int)Math.Round(Bounds.Width * RenderScaling);
+        var physicalWidth = (int)Math.Round(area.Width * _settings.WidthPercent / 100d);
         Width = CalculateLogicalWidth(area.Width, screen.Scaling, _settings.WidthPercent);
-        var y = int.TryParse(Environment.GetEnvironmentVariable("LYRICIFY_Y"), out var configuredY)
-            ? configuredY
-            : 58;
-        Position = new PixelPoint(
-            area.X + (area.Width - physicalWidth) / 2,
-            screen.Bounds.Y + (int)Math.Round(y * screen.Scaling));
+        var physicalHeight = (int)Math.Round(Height * screen.Scaling);
+        var position = useRememberedPosition && remembered is { } saved
+            ? saved
+            : keepCurrentCenter
+                ? new PixelPoint(Position.X + (previousPhysicalWidth - physicalWidth) / 2, Position.Y)
+                : new PixelPoint(
+                    area.X + (area.Width - physicalWidth) / 2,
+                    screen.Bounds.Y + (int)Math.Round(_settings.TopOffset * screen.Scaling));
+        Position = ClampPosition(position, area, physicalWidth, physicalHeight);
+    }
+
+    private Screen? PreferredScreen(PixelPoint? remembered, bool useRememberedPosition)
+    {
+        if (_settings.DisplayId is { } id)
+            return Screens.All.FirstOrDefault(screen => ScreenId(screen) == id);
+        if (useRememberedPosition && remembered is { } point)
+            return Screens.ScreenFromPoint(point);
+        return Screens.Primary;
     }
 }
 
@@ -169,6 +233,12 @@ public sealed class IslandControl : Control, IDisposable
     private long _capsuleTransitionAt;
     private bool _capsuleTransitioning;
     private double _scale = 1d;
+    private int _lyricsOffsetMs;
+    private bool _showTranslation = true;
+    private PausedDisplayMode _pausedDisplay;
+    private bool _inactive;
+    private long _inactiveAt;
+    private bool _delayedHidePending;
     private Rect _pillBounds;
     private PlaybackSnapshot? _renderedSnapshot;
     private bool _animationFrameQueued;
@@ -198,15 +268,19 @@ public sealed class IslandControl : Control, IDisposable
             return;
 
         var snapshot = _store.Snapshot;
-        if (snapshot.IsPlaying || _outgoing is not null || _capsuleTransitioning
+        if (snapshot.IsPlaying || _outgoing is not null || _capsuleTransitioning || _delayedHidePending
             || !ReferenceEquals(snapshot, _renderedSnapshot))
             InvalidateVisual();
         QueueAnimationFrame();
     }
 
-    public void SetScale(double scale)
+    internal void ApplySettings(IslandSettings settings)
     {
-        _scale = Math.Clamp(scale, 0.5d, 2d);
+        _scale = Math.Clamp(settings.ScalePercent / 100d, 0.5d, 2d);
+        _lyricsOffsetMs = settings.LyricsOffsetMs;
+        _showTranslation = settings.ShowTranslation;
+        _pausedDisplay = settings.PausedDisplay;
+        _renderer.SetBackgroundOpacity(settings.BackgroundOpacityPercent);
         InvalidateVisual();
     }
 
@@ -250,8 +324,22 @@ public sealed class IslandControl : Control, IDisposable
         if (transitionSeconds > IslandRenderer.TransitionDuration)
             _outgoing = null;
 
-        var capsuleShown = track is null || snapshot.IsPlaying;
         var now = Stopwatch.GetTimestamp();
+        var requiresAttention = PlaybackStore.RequiresAttention(snapshot.Status);
+        var inactive = !requiresAttention && (track is not null && !snapshot.IsPlaying
+            || track is null && snapshot.Status == PlaybackStore.NoActiveSpotifyPlaybackStatus);
+        if (inactive != _inactive)
+        {
+            _inactive = inactive;
+            _inactiveAt = inactive ? now : 0;
+        }
+        var inactiveSeconds = inactive && _inactiveAt != 0
+            ? Stopwatch.GetElapsedTime(_inactiveAt, now).TotalSeconds
+            : 0d;
+        var capsuleShown = ShouldShowCapsule(inactive, _pausedDisplay, inactiveSeconds);
+        _delayedHidePending = inactive
+            && _pausedDisplay == PausedDisplayMode.HideAfterThreeSeconds
+            && inactiveSeconds < 3d;
         if (capsuleShown != _capsuleShown)
         {
             _capsuleShown = capsuleShown;
@@ -266,15 +354,16 @@ public sealed class IslandControl : Control, IDisposable
         _capsuleTransitioning = capsuleSeconds < IslandRenderer.CapsuleTransitionDuration;
 
         var frame = new IslandFrame(
-            track,
-            _line,
-            _outgoing,
+            requiresAttention ? null : track,
+            requiresAttention ? null : _line,
+            requiresAttention ? null : _outgoing,
             position,
             snapshot.IsPlaying,
             snapshot.Status,
             transitionSeconds,
             _scale,
-            _capsuleProgress);
+            _capsuleProgress,
+            _showTranslation);
         var fullPillBounds = _renderer.CalculatePillBounds((float)Bounds.Width, (float)Bounds.Height, frame);
         var pillBounds = IslandRenderer.ScalePillBounds(fullPillBounds, _capsuleProgress);
         if (pillBounds != _pillBounds)
@@ -286,19 +375,26 @@ public sealed class IslandControl : Control, IDisposable
             new Rect(Bounds.Size), _renderer, frame, fullPillBounds, pillBounds));
     }
 
-    private static double CurrentPosition(PlaybackSnapshot snapshot)
+    private double CurrentPosition(PlaybackSnapshot snapshot)
     {
         var elapsed = snapshot.IsPlaying
             ? Stopwatch.GetElapsedTime(snapshot.ReportedAtTimestamp).TotalMilliseconds
             : 0d;
-        var offset = double.TryParse(
-            Environment.GetEnvironmentVariable("LYRICIFY_OFFSET_MS"),
-            CultureInfo.InvariantCulture,
-            out var value)
-            ? value
-            : 0d;
-        return Math.Clamp(snapshot.ReportedPositionMs + elapsed + offset, 0d, snapshot.Track?.DurationMs ?? double.MaxValue);
+        return ApplyLyricsOffset(snapshot, elapsed, _lyricsOffsetMs);
     }
+
+    internal static double ApplyLyricsOffset(PlaybackSnapshot snapshot, double elapsedMs, int offsetMs) =>
+        Math.Clamp(
+            snapshot.ReportedPositionMs + elapsedMs + offsetMs,
+            0d,
+            snapshot.Track?.DurationMs ?? double.MaxValue);
+
+    internal static bool ShouldShowCapsule(
+        bool inactive,
+        PausedDisplayMode mode,
+        double inactiveSeconds) => !inactive
+            || mode == PausedDisplayMode.KeepVisible
+            || mode == PausedDisplayMode.HideAfterThreeSeconds && inactiveSeconds < 3d;
 
     internal static int FindLine(IReadOnlyList<LyricLine>? lines, double positionMs)
     {
@@ -367,7 +463,8 @@ internal sealed record IslandFrame(
     string? Status,
     double TransitionSeconds,
     double Scale,
-    double CapsuleProgress = 1d);
+    double CapsuleProgress = 1d,
+    bool ShowTranslation = true);
 
 internal sealed class IslandRenderer : IDisposable
 {
@@ -438,6 +535,12 @@ internal sealed class IslandRenderer : IDisposable
             _icon = SKBitmap.Decode(stream);
     }
 
+    internal void SetBackgroundOpacity(double percent) =>
+        _fill.Color = new SKColor(3, 5, 7, BackgroundAlpha(percent));
+
+    internal static byte BackgroundAlpha(double percent) =>
+        (byte)Math.Round(255d * SettingsStore.NormalizeBackgroundOpacityPercent(percent) / 100d);
+
     public void Draw(SKCanvas canvas, float width, float height, IslandFrame frame, Rect? calculatedPillBounds = null)
     {
         var visualScale = (float)Math.Clamp(frame.Scale, 0.5d, 2d);
@@ -483,7 +586,7 @@ internal sealed class IslandRenderer : IDisposable
         {
             var p = Math.Clamp(frame.TransitionSeconds / 0.11, 0d, 1d);
             DrawLineBlock(canvas, frame.Outgoing, frame.PositionMs, clip, mainFonts, _translationFont,
-                1f - 0.25f * (float)EaseOutCubic(p), (float)(1d - EaseOutCubic(p)));
+                1f - 0.25f * (float)EaseOutCubic(p), (float)(1d - EaseOutCubic(p)), frame.ShowTranslation);
         }
 
         var incomingStart = frame.Outgoing is null ? 0d : 0.30d;
@@ -494,7 +597,7 @@ internal sealed class IslandRenderer : IDisposable
                 : Math.Clamp((frame.TransitionSeconds - incomingStart) / 0.60d, 0d, 1d);
             var scale = frame.Outgoing is null ? 1f : (float)(0.75d + 0.25d * Spring(p));
             DrawLineBlock(canvas, frame.Line, frame.PositionMs, clip, mainFonts, _translationFont,
-                scale, (float)EaseOutCubic(p));
+                scale, (float)EaseOutCubic(p), frame.ShowTranslation);
         }
         else if (frame.Line is null)
         {
@@ -556,12 +659,14 @@ internal sealed class IslandRenderer : IDisposable
         MainFontSet mainFonts,
         SKFont translationFont)
     {
-        var settledWidth = DesiredWidth(frame.Track, frame.Line, frame.Status, mainFonts, translationFont);
-        var outgoingWidth = DesiredWidth(frame.Track, frame.Outgoing, frame.Status, mainFonts, translationFont);
+        var settledWidth = DesiredWidth(
+            frame.Track, frame.Line, frame.Status, mainFonts, translationFont, frame.ShowTranslation);
+        var outgoingWidth = DesiredWidth(
+            frame.Track, frame.Outgoing, frame.Status, mainFonts, translationFont, frame.ShowTranslation);
         var pillWidth = Math.Min(width - 16f, AnimatedWidth(outgoingWidth, settledWidth, frame.TransitionSeconds));
         var pillHeight = AnimatedHeight(
-            DesiredPillHeight(frame.Outgoing ?? frame.Line),
-            DesiredPillHeight(frame.Line),
+            DesiredPillHeight(frame.Outgoing ?? frame.Line, frame.ShowTranslation),
+            DesiredPillHeight(frame.Line, frame.ShowTranslation),
             frame.TransitionSeconds);
         var pillLeft = (width - pillWidth) / 2f;
         var pillTop = (height - pillHeight) / 2f - 2f;
@@ -662,14 +767,15 @@ internal sealed class IslandRenderer : IDisposable
         MainFontSet mainFonts,
         SKFont translationFont,
         float scale,
-        float opacity)
+        float opacity,
+        bool showTranslation)
     {
         if (opacity <= 0.001f || scale <= 0.001f)
             return;
 
         var layout = LayoutLine(line, mainFonts);
         var mainWidth = layout.Width;
-        var translation = line.Translation ?? string.Empty;
+        var translation = showTranslation ? line.Translation ?? string.Empty : string.Empty;
         var hasTranslation = !string.IsNullOrWhiteSpace(translation);
         var translationWidth = translationFont.MeasureText(translation);
         var centerX = clip.MidX;
@@ -828,12 +934,13 @@ internal sealed class IslandRenderer : IDisposable
         LyricLine? line,
         string? status,
         MainFontSet mainFonts,
-        SKFont translationFont)
+        SKFont translationFont,
+        bool showTranslation)
     {
         var main = line?.Text ?? track?.Title ?? status ?? "等待 Spotify";
         var sub = line is null
             ? StatusSubtitle(track, status)
-            : line.Translation ?? string.Empty;
+            : showTranslation ? line.Translation ?? string.Empty : string.Empty;
         var content = Math.Max(MeasureMainText(main, mainFonts), translationFont.MeasureText(sub));
         return Math.Max(content + 146f, 390f);
     }
@@ -844,8 +951,8 @@ internal sealed class IslandRenderer : IDisposable
             : "首次启动会打开浏览器授权"
         : status ?? string.Join(", ", track.Artists);
 
-    internal static float DesiredPillHeight(LyricLine? line) =>
-        line is not null && string.IsNullOrWhiteSpace(line.Translation)
+    internal static float DesiredPillHeight(LyricLine? line, bool showTranslation = true) =>
+        line is not null && (!showTranslation || string.IsNullOrWhiteSpace(line.Translation))
             ? SingleLinePillHeight
             : DoubleLinePillHeight;
 
@@ -1215,7 +1322,7 @@ internal sealed class NativeOverlay : IDisposable
     private const int ShapeInput = 2;
     private IntPtr _display;
     private readonly IntPtr _window;
-    private readonly bool _clickThrough;
+    private bool _clickThrough;
     private PixelRect? _inputBounds;
     private bool _inputConfigured;
     private bool _inputTransparent;
@@ -1303,6 +1410,14 @@ internal sealed class NativeOverlay : IDisposable
             if (region != IntPtr.Zero)
                 XFixesDestroyRegion(_display, region);
         }
+    }
+
+    public void SetClickThrough(bool clickThrough)
+    {
+        if (_clickThrough == clickThrough)
+            return;
+        _clickThrough = clickThrough;
+        _inputConfigured = false;
     }
 
     public void RestoreWindowState()

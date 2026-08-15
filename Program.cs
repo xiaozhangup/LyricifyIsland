@@ -77,11 +77,7 @@ public sealed class App : Application
     private PlaybackStore? _store;
     private CancellationTokenSource? _spotifyCancellation;
     private Task? _spotifyTask;
-    private IslandSettings _settings = new(
-        SettingsStore.DefaultWidthPercent,
-        SettingsStore.DefaultScalePercent,
-        string.Empty,
-        string.Empty);
+    private IslandSettings _settings = new();
 
     public override void Initialize()
     {
@@ -100,7 +96,9 @@ public sealed class App : Application
         {
             _store = new PlaybackStore();
             _settings = SettingsStore.Load();
-            _overlay = new OverlayWindow(_store, _settings, () => desktop.Shutdown());
+            if (_settings.StartOnLogin)
+                Autostart.SetEnabled(true);
+            _overlay = new OverlayWindow(_store, _settings, SavePosition, () => desktop.Shutdown());
             desktop.MainWindow = _overlay;
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             CreateTrayIcon(desktop);
@@ -160,15 +158,33 @@ public sealed class App : Application
 
     private bool ApplySettings(IslandSettings settings, bool reconnectSpotify)
     {
+        if (settings.RememberPosition && _settings.RememberPosition)
+            settings = settings with { WindowX = _settings.WindowX, WindowY = _settings.WindowY };
         settings = SettingsStore.Normalize(settings);
-        if (!SettingsStore.Save(settings))
+        var autostartChanged = settings.StartOnLogin != _settings.StartOnLogin;
+        if (autostartChanged && !Autostart.SetEnabled(settings.StartOnLogin))
             return false;
+        if (!SettingsStore.Save(settings))
+        {
+            if (autostartChanged)
+                Autostart.SetEnabled(_settings.StartOnLogin);
+            return false;
+        }
 
         _settings = settings;
         _overlay?.ApplySettings(_settings);
         if (reconnectSpotify && !Program.Options.Demo)
             _ = RestartSpotifyAsync();
         return true;
+    }
+
+    private void SavePosition(PixelPoint position)
+    {
+        if (!_settings.RememberPosition)
+            return;
+        var updated = _settings with { WindowX = position.X, WindowY = position.Y };
+        if (SettingsStore.Save(updated))
+            _settings = updated;
     }
 
     private async Task RestartSpotifyAsync()
@@ -338,6 +354,9 @@ internal static class SelfCheck
         Require(IslandRenderer.DesiredPillHeight(track.Lyrics[0] with { Translation = null })
                 < IslandRenderer.DesiredPillHeight(track.Lyrics[0]),
             "single-line island height");
+        Require(IslandRenderer.DesiredPillHeight(track.Lyrics[0], showTranslation: false)
+                == IslandRenderer.DesiredPillHeight(track.Lyrics[0] with { Translation = null }),
+            "hidden translation island height");
 
         var peak = Enumerable.Range(0, 101).Max(i => IslandRenderer.Spring(i / 100d));
         Require(peak is > 1.15 and < 1.22, "spring overshoot");
@@ -350,6 +369,17 @@ internal static class SelfCheck
                     1d, 0d, IslandRenderer.CapsuleTransitionDuration) == 0d
                 && IslandRenderer.AnimatedCapsuleProgress(0.4d, 1d, 0d) == 0.4d,
             "capsule pause animation");
+        Require(!IslandControl.ShouldShowCapsule(true, PausedDisplayMode.HideImmediately, 0d)
+                && IslandControl.ShouldShowCapsule(true, PausedDisplayMode.HideAfterThreeSeconds, 2.99d)
+                && !IslandControl.ShouldShowCapsule(true, PausedDisplayMode.HideAfterThreeSeconds, 3d)
+                && IslandControl.ShouldShowCapsule(true, PausedDisplayMode.KeepVisible, 99d)
+                && IslandControl.ShouldShowCapsule(false, PausedDisplayMode.HideImmediately, 99d),
+            "paused display modes");
+        Require(PlaybackStore.RequiresAttention(PlaybackStore.MissingSpotifyCredentialsStatus)
+                && PlaybackStore.RequiresAttention("Spotify 连接失败：timeout")
+                && !PlaybackStore.RequiresAttention(PlaybackStore.NoActiveSpotifyPlaybackStatus)
+                && !PlaybackStore.RequiresAttention("演示模式"),
+            "playback status visibility");
         var fullCapsule = new Rect(100d, 20d, 400d, 90d);
         var halfCapsule = IslandRenderer.ScalePillBounds(fullCapsule, 0.5d);
         var hiddenCapsule = IslandRenderer.ScalePillBounds(fullCapsule, 0d);
@@ -386,6 +416,9 @@ internal static class SelfCheck
         var reportedAt = Stopwatch.GetTimestamp();
         var previousPlayback = new PlaybackSnapshot(
             track, 10_000, reportedAt - Stopwatch.Frequency, true, "test");
+        Require(IslandControl.ApplyLyricsOffset(previousPlayback, 500d, 250) == 10_750d
+                && IslandControl.ApplyLyricsOffset(previousPlayback with { ReportedPositionMs = 100 }, 0d, -500) == 0d,
+            "lyrics offset");
         Require(SpotifyService.StabilizePosition(
                 previousPlayback, track.Id, 8_000, reportedAt, true, true) == 11_000,
             "stale playback position");
@@ -415,6 +448,14 @@ internal static class SelfCheck
         Require(SettingsStore.NormalizeScalePercent(double.NaN) == 100d, "invalid scale setting");
         Require(SettingsStore.NormalizeScalePercent(12d) == 50d, "minimum scale setting");
         Require(SettingsStore.NormalizeScalePercent(220d) == 200d, "maximum scale setting");
+        Require(SettingsStore.NormalizeTopOffset(-1) == 0
+                && SettingsStore.NormalizeLyricsOffsetMs(3_000) == 2_000
+                && SettingsStore.NormalizeBackgroundOpacityPercent(10d) == 35d
+                && SettingsStore.NormalizeTemporaryHideSeconds(7) == 2,
+            "custom setting bounds");
+        Require(IslandRenderer.BackgroundAlpha(95d) == 242
+                && IslandRenderer.BackgroundAlpha(35d) == 89,
+            "background opacity");
         var configured = SettingsStore.Normalize(new IslandSettings(70d, 100d, " client ", " secret "));
         Require(configured.HasSpotifyCredentials
                 && configured.SpotifyClientId == "client"
@@ -435,6 +476,9 @@ internal static class SelfCheck
         Require(OverlayWindow.CenteredHorizontally(
                 new PixelPoint(0, 321), new PixelRect(100, 0, 1_000, 500), 400)
             == new PixelPoint(400, 321), "horizontal-only centering");
+        Require(OverlayWindow.ClampPosition(
+                new PixelPoint(-500, 900), new PixelRect(100, 50, 1_000, 600), 400, 100)
+            == new PixelPoint(100, 550), "screen position clamping");
         var inputRows = NativeOverlay.CapsuleRows(new PixelRect(10, 20, 100, 40));
         Require(inputRows.Length == 40
                 && inputRows[0].X > 10
@@ -452,7 +496,24 @@ internal static class SelfCheck
         try
         {
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", configHome);
-            var expected = new IslandSettings(80d, 120d, "client", "secret");
+            var expected = new IslandSettings(
+                80d,
+                120d,
+                "client",
+                "secret",
+                90,
+                -350,
+                false,
+                55d,
+                true,
+                true,
+                true,
+                PausedDisplayMode.KeepVisible,
+                10,
+                true,
+                "display-id",
+                123,
+                456);
             Require(SettingsStore.Save(expected), "settings save");
             Require(SettingsStore.Load() == expected, "settings round trip");
             if (!OperatingSystem.IsWindows())
@@ -464,6 +525,15 @@ internal static class SelfCheck
                 Require(File.GetUnixFileMode(Path.Combine(directory, "settings.json"))
                         == (UnixFileMode.UserRead | UnixFileMode.UserWrite),
                     "settings file permissions");
+            }
+            if (OperatingSystem.IsLinux())
+            {
+                Require(Autostart.SetEnabled(true, "/tmp/Lyricify Island/$app"), "autostart enable");
+                var autostartPath = Path.Combine(configHome, "autostart", "lyricify-island.desktop");
+                var desktopEntry = File.ReadAllText(autostartPath);
+                Require(desktopEntry.Contains("Exec=\"/tmp/Lyricify Island/\\$app\""),
+                    "autostart executable quoting");
+                Require(Autostart.SetEnabled(false) && !File.Exists(autostartPath), "autostart disable");
             }
         }
         finally

@@ -44,6 +44,14 @@ internal sealed record SpotifyTrack(
 public sealed class PlaybackStore
 {
     public const string MissingSpotifyCredentialsStatus = "请到设置内配置 Spotify 参数";
+    public const string NoActiveSpotifyPlaybackStatus = "Spotify 当前没有播放";
+
+    internal static bool RequiresAttention(string status) =>
+        status == MissingSpotifyCredentialsStatus
+        || status.StartsWith("正在连接 Spotify", StringComparison.Ordinal)
+        || status.StartsWith("正在等待 Spotify 授权", StringComparison.Ordinal)
+        || status != NoActiveSpotifyPlaybackStatus
+            && status.StartsWith("Spotify ", StringComparison.Ordinal);
 
     private PlaybackSnapshot _snapshot = new(null, 0, System.Diagnostics.Stopwatch.GetTimestamp(), false, "正在连接 Spotify…");
 
