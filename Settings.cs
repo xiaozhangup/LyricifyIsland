@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text.Json;
 using Avalonia;
 using Avalonia.Automation;
@@ -13,6 +14,14 @@ internal enum PausedDisplayMode
     HideImmediately,
     HideAfterThreeSeconds,
     KeepVisible
+}
+
+internal enum LyricsSourcePreference
+{
+    Automatic,
+    Netease,
+    Kugou,
+    Lrclib
 }
 
 internal readonly record struct IslandSettings(
@@ -32,11 +41,56 @@ internal readonly record struct IslandSettings(
     bool StartOnLogin = false,
     string? DisplayId = null,
     int? WindowX = null,
-    int? WindowY = null)
+    int? WindowY = null,
+    LyricsSourcePreference LyricsSource = LyricsSourcePreference.Automatic,
+    bool EnableTrackOffsets = false,
+    ImmutableDictionary<string, int>? TrackOffsetsMs = null,
+    ImmutableDictionary<string, string>? TrackOffsetTitles = null)
 {
     public bool HasSpotifyCredentials =>
         !string.IsNullOrWhiteSpace(SpotifyClientId)
         && !string.IsNullOrWhiteSpace(SpotifyClientSecret);
+
+    public int TrackOffsetFor(string? trackId) => trackId is not null
+        && TrackOffsetsMs?.TryGetValue(trackId, out var offset) == true
+            ? offset
+            : 0;
+
+    public string TrackOffsetTitleFor(string trackId) =>
+        TrackOffsetTitles?.TryGetValue(trackId, out var title) == true ? title : trackId;
+
+    public IslandSettings WithTrackOffset(TrackInfo track, int offsetMs) => WithTrackOffset(
+        track.Id,
+        track.Artists.IsDefaultOrEmpty
+            ? track.Title
+            : $"{track.Title} — {string.Join(", ", track.Artists)}",
+        offsetMs);
+
+    public IslandSettings WithTrackOffset(string trackId, string? title, int offsetMs)
+    {
+        var offsets = TrackOffsetsMs ?? ImmutableDictionary<string, int>.Empty;
+        var titles = TrackOffsetTitles ?? ImmutableDictionary<string, string>.Empty;
+        offsetMs = SettingsStore.NormalizeLyricsOffsetMs(offsetMs);
+        offsets = offsets.SetItem(trackId, offsetMs);
+        if (!string.IsNullOrWhiteSpace(title))
+            titles = titles.SetItem(trackId, title.Trim());
+        return this with
+        {
+            TrackOffsetsMs = offsets.IsEmpty ? null : offsets,
+            TrackOffsetTitles = titles.IsEmpty ? null : titles
+        };
+    }
+
+    public IslandSettings RemoveTrackOffset(string trackId)
+    {
+        var offsets = TrackOffsetsMs?.Remove(trackId);
+        var titles = TrackOffsetTitles?.Remove(trackId);
+        return this with
+        {
+            TrackOffsetsMs = offsets is null || offsets.IsEmpty ? null : offsets,
+            TrackOffsetTitles = titles is null || titles.IsEmpty ? null : titles
+        };
+    }
 }
 
 internal static class SettingsStore
@@ -88,7 +142,11 @@ internal static class SettingsStore
                 data?.StartOnLogin ?? false,
                 data?.DisplayId,
                 data?.WindowX,
-                data?.WindowY));
+                data?.WindowY,
+                data?.LyricsSource ?? LyricsSourcePreference.Automatic,
+                data?.EnableTrackOffsets ?? data?.TrackOffsetsMs is { Count: > 0 },
+                data?.TrackOffsetsMs?.ToImmutableDictionary(StringComparer.Ordinal),
+                data?.TrackOffsetTitles?.ToImmutableDictionary(StringComparer.Ordinal)));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -129,7 +187,11 @@ internal static class SettingsStore
                     StartOnLogin = settings.StartOnLogin,
                     DisplayId = settings.DisplayId,
                     WindowX = settings.WindowX,
-                    WindowY = settings.WindowY
+                    WindowY = settings.WindowY,
+                    LyricsSource = settings.LyricsSource,
+                    EnableTrackOffsets = settings.EnableTrackOffsets,
+                    TrackOffsetsMs = settings.TrackOffsetsMs?.ToDictionary(),
+                    TrackOffsetTitles = settings.TrackOffsetTitles?.ToDictionary()
                 }));
             Secure(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             File.Move(temporary, path, overwrite: true);
@@ -169,23 +231,63 @@ internal static class SettingsStore
         ? value
         : DefaultTemporaryHideSeconds;
 
-    internal static IslandSettings Normalize(IslandSettings settings) => settings with
+    internal static IslandSettings Normalize(IslandSettings settings)
     {
-        WidthPercent = NormalizeWidthPercent(settings.WidthPercent),
-        ScalePercent = NormalizeScalePercent(settings.ScalePercent),
-        SpotifyClientId = settings.SpotifyClientId?.Trim() ?? string.Empty,
-        SpotifyClientSecret = settings.SpotifyClientSecret?.Trim() ?? string.Empty,
-        TopOffset = NormalizeTopOffset(settings.TopOffset),
-        LyricsOffsetMs = NormalizeLyricsOffsetMs(settings.LyricsOffsetMs),
-        BackgroundOpacityPercent = NormalizeBackgroundOpacityPercent(settings.BackgroundOpacityPercent),
-        PausedDisplay = Enum.IsDefined(settings.PausedDisplay)
-            ? settings.PausedDisplay
-            : PausedDisplayMode.HideImmediately,
-        TemporaryHideSeconds = NormalizeTemporaryHideSeconds(settings.TemporaryHideSeconds),
-        DisplayId = string.IsNullOrWhiteSpace(settings.DisplayId) ? null : settings.DisplayId.Trim(),
-        WindowX = settings.RememberPosition ? settings.WindowX : null,
-        WindowY = settings.RememberPosition ? settings.WindowY : null
-    };
+        var offsets = NormalizeTrackOffsets(settings.TrackOffsetsMs);
+        return settings with
+        {
+            WidthPercent = NormalizeWidthPercent(settings.WidthPercent),
+            ScalePercent = NormalizeScalePercent(settings.ScalePercent),
+            SpotifyClientId = settings.SpotifyClientId?.Trim() ?? string.Empty,
+            SpotifyClientSecret = settings.SpotifyClientSecret?.Trim() ?? string.Empty,
+            TopOffset = NormalizeTopOffset(settings.TopOffset),
+            LyricsOffsetMs = NormalizeLyricsOffsetMs(settings.LyricsOffsetMs),
+            BackgroundOpacityPercent = NormalizeBackgroundOpacityPercent(settings.BackgroundOpacityPercent),
+            PausedDisplay = Enum.IsDefined(settings.PausedDisplay)
+                ? settings.PausedDisplay
+                : PausedDisplayMode.HideImmediately,
+            LyricsSource = Enum.IsDefined(settings.LyricsSource)
+                ? settings.LyricsSource
+                : LyricsSourcePreference.Automatic,
+            TemporaryHideSeconds = NormalizeTemporaryHideSeconds(settings.TemporaryHideSeconds),
+            DisplayId = string.IsNullOrWhiteSpace(settings.DisplayId) ? null : settings.DisplayId.Trim(),
+            WindowX = settings.RememberPosition ? settings.WindowX : null,
+            WindowY = settings.RememberPosition ? settings.WindowY : null,
+            TrackOffsetsMs = offsets,
+            TrackOffsetTitles = NormalizeTrackOffsetTitles(settings.TrackOffsetTitles, offsets)
+        };
+    }
+
+    private static ImmutableDictionary<string, int>? NormalizeTrackOffsets(
+        ImmutableDictionary<string, int>? offsets)
+    {
+        if (offsets is null || offsets.Count == 0)
+            return null;
+
+        var normalized = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
+        foreach (var (trackId, offset) in offsets)
+        {
+            if (!string.IsNullOrWhiteSpace(trackId))
+                normalized[trackId] = NormalizeLyricsOffsetMs(offset);
+        }
+        return normalized.Count == 0 ? null : normalized.ToImmutable();
+    }
+
+    private static ImmutableDictionary<string, string>? NormalizeTrackOffsetTitles(
+        ImmutableDictionary<string, string>? titles,
+        ImmutableDictionary<string, int>? offsets)
+    {
+        if (titles is null || offsets is null)
+            return null;
+
+        var normalized = ImmutableDictionary.CreateBuilder<string, string>(StringComparer.Ordinal);
+        foreach (var (trackId, title) in titles)
+        {
+            if (offsets.ContainsKey(trackId) && !string.IsNullOrWhiteSpace(title))
+                normalized[trackId] = title.Trim();
+        }
+        return normalized.Count == 0 ? null : normalized.ToImmutable();
+    }
 
     internal static string ConfigHome()
     {
@@ -227,6 +329,10 @@ internal static class SettingsStore
         public string? DisplayId { get; init; }
         public int? WindowX { get; init; }
         public int? WindowY { get; init; }
+        public LyricsSourcePreference? LyricsSource { get; init; }
+        public bool? EnableTrackOffsets { get; init; }
+        public Dictionary<string, int>? TrackOffsetsMs { get; init; }
+        public Dictionary<string, string>? TrackOffsetTitles { get; init; }
     }
 }
 
@@ -299,7 +405,9 @@ internal sealed class SettingsWindow : Window
     public SettingsWindow(
         IslandSettings initialSettings,
         WindowIcon icon,
-        Func<IslandSettings, bool, bool> settingsChanged)
+        Func<IslandSettings, bool, bool> settingsChanged,
+        Func<IslandSettings> currentSettings,
+        Func<bool> refreshCurrentTrack)
     {
         var settings = SettingsStore.Normalize(initialSettings);
         Title = "Lyricify Island 设置";
@@ -314,8 +422,20 @@ internal sealed class SettingsWindow : Window
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         RequestedThemeVariant = ThemeVariant.Dark;
 
-        bool Commit(IslandSettings updated, bool reconnectSpotify = false)
+        bool Commit(
+            IslandSettings updated,
+            bool reconnectSpotify = false,
+            bool trackOffsetsChanged = false)
         {
+            if (!trackOffsetsChanged)
+            {
+                var latest = currentSettings();
+                updated = updated with
+                {
+                    TrackOffsetsMs = latest.TrackOffsetsMs,
+                    TrackOffsetTitles = latest.TrackOffsetTitles
+                };
+            }
             updated = SettingsStore.Normalize(updated);
             if (!settingsChanged(updated, reconnectSpotify))
                 return false;
@@ -371,6 +491,291 @@ internal sealed class SettingsWindow : Window
                             BackgroundOpacityPercent = SettingsStore.NormalizeBackgroundOpacityPercent(value)
                         })))));
 
+        var sourceChoices = new[]
+        {
+            new Choice<LyricsSourcePreference>(LyricsSourcePreference.Automatic, "自动（逐字优先）"),
+            new Choice<LyricsSourcePreference>(LyricsSourcePreference.Netease, "网易云"),
+            new Choice<LyricsSourcePreference>(LyricsSourcePreference.Kugou, "酷狗"),
+            new Choice<LyricsSourcePreference>(LyricsSourcePreference.Lrclib, "LRCLIB")
+        };
+        var trackOffsetManagerTitle = new TextBlock
+        {
+            Foreground = PrimaryText,
+            FontWeight = FontWeight.SemiBold
+        };
+        var trackOffsetList = new StackPanel();
+        var trackOffsetManagerCard = new Border
+        {
+            IsVisible = false,
+            Margin = new Thickness(0, 4, 0, 0),
+            Padding = new Thickness(0, 4, 0, 0),
+            BorderBrush = CardBorder,
+            BorderThickness = new Thickness(0, 1, 0, 0),
+            Child = trackOffsetList
+        };
+        var trackOffsetManagerIndicator = new TextBlock
+        {
+            Text = "▾",
+            Foreground = MutedText,
+            FontSize = 15,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var trackOffsetManagerHeaderContent = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("*,Auto"),
+            Children = { trackOffsetManagerTitle, trackOffsetManagerIndicator }
+        };
+        Grid.SetColumn(trackOffsetManagerIndicator, 1);
+        var trackOffsetManagerHeader = new Button
+        {
+            MinHeight = 32,
+            Padding = new Thickness(0, 4),
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch,
+            Content = trackOffsetManagerHeaderContent
+        };
+        var trackOffsetManager = new Border
+        {
+            Margin = new Thickness(0, 4, 0, 0),
+            Padding = new Thickness(12, 6),
+            Background = InputBackground,
+            BorderBrush = CardBorder,
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Child = new StackPanel
+            {
+                Children = { trackOffsetManagerHeader, trackOffsetManagerCard }
+            }
+        };
+
+        void SetTrackOffsetManagerExpanded(bool expanded)
+        {
+            trackOffsetManagerCard.IsVisible = expanded;
+            trackOffsetManagerIndicator.Text = expanded ? "▴" : "▾";
+            AutomationProperties.SetName(
+                trackOffsetManagerHeader,
+                expanded ? "收起已设置歌曲" : "展开已设置歌曲");
+        }
+
+        SetTrackOffsetManagerExpanded(false);
+        trackOffsetManagerHeader.Click += (_, _) =>
+            SetTrackOffsetManagerExpanded(!trackOffsetManagerCard.IsVisible);
+
+        void RefreshTrackOffsetManager()
+        {
+            trackOffsetManager.IsVisible = settings.EnableTrackOffsets;
+            if (!settings.EnableTrackOffsets)
+            {
+                SetTrackOffsetManagerExpanded(false);
+                return;
+            }
+
+            var offsets = settings.TrackOffsetsMs;
+            trackOffsetManagerTitle.Text = $"已设置歌曲（{offsets?.Count ?? 0}）";
+            trackOffsetList.Children.Clear();
+            if (offsets is null)
+            {
+                trackOffsetList.Children.Add(new TextBlock
+                {
+                    Text = "还没有保存过歌曲偏移。播放歌曲后，在灵动岛上右键即可添加。",
+                    Foreground = MutedText,
+                    FontSize = 12,
+                    TextWrapping = TextWrapping.Wrap
+                });
+                return;
+            }
+
+            foreach (var (trackId, value) in offsets.OrderBy(
+                         entry => settings.TrackOffsetTitleFor(entry.Key),
+                         StringComparer.Ordinal))
+            {
+                var title = settings.TrackOffsetTitleFor(trackId);
+                var slider = new Slider
+                {
+                    Minimum = SettingsStore.MinimumLyricsOffsetMs,
+                    Maximum = SettingsStore.MaximumLyricsOffsetMs,
+                    TickFrequency = 50,
+                    SmallChange = 50,
+                    LargeChange = 100,
+                    IsSnapToTickEnabled = true,
+                    Value = value,
+                    MinWidth = 130,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Foreground = Accent
+                };
+                AutomationProperties.SetName(slider, $"{title} 歌词偏移滑杆");
+                var editorBackground = Brush("#353535");
+                var editorBorder = Brush("#404040");
+                var editor = new NumericUpDown
+                {
+                    Minimum = SettingsStore.MinimumLyricsOffsetMs,
+                    Maximum = SettingsStore.MaximumLyricsOffsetMs,
+                    ClipValueToMinMax = true,
+                    ShowButtonSpinner = false,
+                    AllowSpin = false,
+                    FormatString = "0",
+                    Value = value,
+                    Width = 78,
+                    Height = 36,
+                    Padding = new Thickness(8, 4),
+                    Background = editorBackground,
+                    BorderBrush = editorBorder,
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(6),
+                    Foreground = PrimaryText,
+                    FontSize = 15,
+                    FontWeight = FontWeight.SemiBold,
+                    TextAlignment = TextAlignment.Right,
+                    VerticalContentAlignment = VerticalAlignment.Center
+                };
+                editor.Resources["TextControlBackground"] = editorBackground;
+                editor.Resources["TextControlBackgroundPointerOver"] = editorBackground;
+                editor.Resources["TextControlBackgroundFocused"] = editorBackground;
+                editor.Resources["TextControlBorderBrush"] = editorBorder;
+                editor.Resources["TextControlBorderBrushPointerOver"] = editorBorder;
+                editor.Resources["TextControlBorderBrushFocused"] = Accent;
+                editor.Resources["TextControlThemePadding"] = new Thickness(8, 4);
+                AutomationProperties.SetName(editor, $"{title} 歌词偏移毫秒");
+
+                var syncing = false;
+                void SyncControls(int updatedValue)
+                {
+                    syncing = true;
+                    slider.Value = updatedValue;
+                    editor.Value = updatedValue;
+                    syncing = false;
+                }
+
+                void UpdateOffset(int updatedValue)
+                {
+                    if (syncing)
+                        return;
+                    updatedValue = SettingsStore.NormalizeLyricsOffsetMs(updatedValue);
+                    var latest = currentSettings();
+                    var previousValue = latest.TrackOffsetFor(trackId);
+                    SyncControls(updatedValue);
+                    if (!Commit(
+                            latest.WithTrackOffset(trackId, title, updatedValue),
+                            trackOffsetsChanged: true))
+                        SyncControls(previousValue);
+                }
+
+                slider.ValueChanged += (_, args) =>
+                    UpdateOffset((int)Math.Round(args.NewValue));
+                editor.ValueChanged += (_, _) =>
+                {
+                    if (editor.Value is not { } updatedValue)
+                        return;
+                    UpdateOffset((int)updatedValue);
+                };
+
+                var remove = new Button
+                {
+                    Width = 32,
+                    Height = 32,
+                    Padding = new Thickness(7),
+                    Background = Brushes.Transparent,
+                    BorderThickness = new Thickness(0),
+                    CornerRadius = new CornerRadius(16),
+                    Content = new PathIcon
+                    {
+                        Data = Geometry.Parse(CacheIcon),
+                        Foreground = MutedText
+                    }
+                };
+                AutomationProperties.SetName(remove, $"删除 {title} 的歌词偏移");
+                ToolTip.SetTip(remove, "删除歌曲偏移");
+                remove.Click += (_, _) =>
+                {
+                    if (Commit(
+                            currentSettings().RemoveTrackOffset(trackId),
+                            trackOffsetsChanged: true))
+                        RefreshTrackOffsetManager();
+                };
+                var controls = new Grid
+                {
+                    Width = 286,
+                    ColumnDefinitions = new ColumnDefinitions("78,4,24,10,130,8,32"),
+                    Children = { editor, slider, remove }
+                };
+                var unit = new TextBlock
+                {
+                    Text = "ms",
+                    Foreground = MutedText,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                Grid.SetColumn(unit, 2);
+                controls.Children.Add(unit);
+                Grid.SetColumn(slider, 4);
+                Grid.SetColumn(remove, 6);
+                var rowContent = new Grid
+                {
+                    MinHeight = 40,
+                    ColumnDefinitions = new ColumnDefinitions("*,18,Auto"),
+                    Children =
+                    {
+                        new TextBlock
+                        {
+                            Text = title,
+                            Foreground = PrimaryText,
+                            FontWeight = FontWeight.SemiBold,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                            VerticalAlignment = VerticalAlignment.Center
+                        },
+                        controls
+                    }
+                };
+                Grid.SetColumn(controls, 2);
+                var row = new Border
+                {
+                    Padding = new Thickness(0, 2),
+                    BorderBrush = CardBorder,
+                    BorderThickness = new Thickness(0, 0, 0, 1),
+                    Child = rowContent
+                };
+                trackOffsetList.Children.Add(row);
+            }
+        }
+
+        var enableTrackOffsets = CreateToggle(
+            "启用每首歌曲歌词偏移",
+            settings.EnableTrackOffsets,
+            value =>
+            {
+                if (Commit(settings with { EnableTrackOffsets = value }))
+                    RefreshTrackOffsetManager();
+            });
+        RefreshTrackOffsetManager();
+        Activated += (_, _) =>
+        {
+            var latest = currentSettings();
+            settings = settings with
+            {
+                TrackOffsetsMs = latest.TrackOffsetsMs,
+                TrackOffsetTitles = latest.TrackOffsetTitles
+            };
+            RefreshTrackOffsetManager();
+        };
+
+        var refreshStatus = new TextBlock
+        {
+            Foreground = MutedText,
+            FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var refreshTrack = SecondaryButton("重新获取");
+        refreshTrack.Click += (_, _) => refreshStatus.Text = refreshCurrentTrack()
+            ? "已开始"
+            : "当前没有歌曲";
+        var refreshAction = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 10,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { refreshStatus, refreshTrack }
+        };
+
         var lyrics = CreateCard(
             MusicIcon,
             "歌词",
@@ -394,7 +799,24 @@ internal sealed class SettingsWindow : Window
                         value => Commit(settings with
                         {
                             LyricsOffsetMs = SettingsStore.NormalizeLyricsOffsetMs((int)value)
-                        })))));
+                        }))),
+                CreateSettingRow(
+                    "每首歌曲偏移",
+                    "开启后可在灵动岛右键菜单中调整当前歌曲",
+                    enableTrackOffsets),
+                trackOffsetManager,
+                CreateSettingRow(
+                    "首选歌词源",
+                    "首选源没有结果时继续尝试其他来源",
+                    CreateChoice(
+                        "首选歌词源",
+                        sourceChoices,
+                        sourceChoices.First(choice => choice.Value == settings.LyricsSource),
+                        value => Commit(settings with { LyricsSource = value }))),
+                CreateSettingRow(
+                    "重新获取当前歌曲",
+                    "忽略本次缓存结果，重新请求歌词和歌曲信息",
+                    refreshAction)));
 
         var displayChoices = new List<Choice<string?>>
         {
@@ -747,7 +1169,8 @@ internal sealed class SettingsWindow : Window
                 {
                     Text = title,
                     Foreground = PrimaryText,
-                    FontWeight = FontWeight.SemiBold
+                    FontWeight = FontWeight.SemiBold,
+                    TextTrimming = TextTrimming.CharacterEllipsis
                 },
                 new TextBlock
                 {

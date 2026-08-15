@@ -1,9 +1,11 @@
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using Avalonia;
+using Avalonia.Animation;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Media;
@@ -19,9 +21,19 @@ namespace LyricifyIsland;
 public sealed class OverlayWindow : Window
 {
     private const double BaseHeight = 116d;
+    private static readonly IBrush MenuBackground = new SolidColorBrush(Color.Parse("#101010"));
+    private static readonly IBrush MenuBorder = new SolidColorBrush(Color.Parse("#2A2A2A"));
+    private static readonly IBrush MenuForeground = new SolidColorBrush(Color.Parse("#F5F5F5"));
+    private static readonly IBrush MenuDisabled = new SolidColorBrush(Color.Parse("#777777"));
+    private readonly PlaybackStore _store;
     private readonly IslandControl _island;
     private readonly Action<PixelPoint> _positionChanged;
+    private readonly Func<TrackInfo, int, bool> _trackOffsetChanged;
     private readonly MenuItem _hideItem;
+    private readonly MenuItem _earlierTrackOffsetItem;
+    private readonly MenuItem _laterTrackOffsetItem;
+    private readonly MenuItem _resetTrackOffsetItem;
+    private readonly Separator _trackOffsetSeparator;
     private readonly DispatcherTimer _positionSaveTimer;
     private IslandSettings _settings;
     private NativeOverlay? _nativeOverlay;
@@ -33,10 +45,14 @@ public sealed class OverlayWindow : Window
         PlaybackStore store,
         IslandSettings settings,
         Action<PixelPoint> positionChanged,
+        Func<TrackInfo, int, bool> trackOffsetChanged,
+        Action showSettings,
         Action exit)
     {
+        _store = store;
         _settings = SettingsStore.Normalize(settings);
         _positionChanged = positionChanged;
+        _trackOffsetChanged = trackOffsetChanged;
         Width = 960;
         Height = CalculateLogicalHeight(_settings.ScalePercent);
         Background = Brushes.Transparent;
@@ -68,13 +84,63 @@ public sealed class OverlayWindow : Window
             }
         };
 
-        _hideItem = new MenuItem { Header = HideLabel(_settings.TemporaryHideSeconds) };
+        _hideItem = CreateContextMenuItem(HideLabel(_settings.TemporaryHideSeconds));
         _hideItem.Click += (_, _) => _ = HideTemporarilyAsync();
-        var center = new MenuItem { Header = "居中" };
+        _earlierTrackOffsetItem = CreateContextMenuItem("歌词提前 100 ms");
+        _earlierTrackOffsetItem.StaysOpenOnClick = true;
+        _earlierTrackOffsetItem.Click += (_, _) => AdjustTrackOffset(100);
+        _laterTrackOffsetItem = CreateContextMenuItem("歌词延后 100 ms");
+        _laterTrackOffsetItem.StaysOpenOnClick = true;
+        _laterTrackOffsetItem.Click += (_, _) => AdjustTrackOffset(-100);
+        _resetTrackOffsetItem = CreateContextMenuItem("归零");
+        _resetTrackOffsetItem.StaysOpenOnClick = true;
+        _resetTrackOffsetItem.Click += (_, _) => ResetTrackOffset();
+        _trackOffsetSeparator = CreateMenuSeparator();
+        var center = CreateContextMenuItem("水平居中");
         center.Click += (_, _) => CenterHorizontally();
-        var exitItem = new MenuItem { Header = "退出" };
+        var settingsItem = CreateContextMenuItem("设置…");
+        settingsItem.Click += (_, _) => showSettings();
+        var exitItem = CreateContextMenuItem("退出");
         exitItem.Click += (_, _) => exit();
-        _island.ContextMenu = new ContextMenu { ItemsSource = new[] { _hideItem, center, exitItem } };
+        var contextMenu = new ContextMenu
+        {
+            ItemsSource = new Control[]
+            {
+                _hideItem,
+                center,
+                _trackOffsetSeparator,
+                _earlierTrackOffsetItem,
+                _laterTrackOffsetItem,
+                _resetTrackOffsetItem,
+                CreateMenuSeparator(),
+                settingsItem,
+                exitItem
+            },
+            Width = 180,
+            Padding = new Thickness(4),
+            Background = MenuBackground,
+            Foreground = MenuForeground,
+            BorderBrush = MenuBorder,
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(10),
+            FontFamily = new FontFamily("Noto Sans CJK SC"),
+            FontSize = 12.5,
+            LetterSpacing = 0,
+            WindowManagerAddShadowHint = true
+        };
+        contextMenu.Resources["MenuFlyoutPresenterBackground"] = MenuBackground;
+        contextMenu.Resources["MenuFlyoutPresenterBorderBrush"] = MenuBorder;
+        contextMenu.Resources["MenuFlyoutPresenterBorderThemeThickness"] = new Thickness(1);
+        contextMenu.Resources["MenuFlyoutPresenterThemePadding"] = new Thickness(4);
+        contextMenu.Resources["MenuFlyoutThemeMinHeight"] = 30d;
+        contextMenu.Resources["MenuFlyoutItemThemePadding"] = new Thickness(9, 4);
+        contextMenu.Resources["MenuFlyoutItemForeground"] = MenuForeground;
+        contextMenu.Resources["MenuFlyoutItemForegroundPointerOver"] = MenuForeground;
+        contextMenu.Resources["MenuFlyoutItemForegroundPressed"] = MenuForeground;
+        contextMenu.Resources["MenuFlyoutItemForegroundDisabled"] = MenuDisabled;
+        contextMenu.Opening += (_, _) => RefreshTrackOffsetMenu();
+        _island.ContextMenu = contextMenu;
+        RefreshTrackOffsetMenu();
         Content = _island;
 
         _positionSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
@@ -121,6 +187,7 @@ public sealed class OverlayWindow : Window
         Height = CalculateLogicalHeight(_settings.ScalePercent);
         _island.ApplySettings(_settings);
         _hideItem.Header = HideLabel(_settings.TemporaryHideSeconds);
+        RefreshTrackOffsetMenu();
         _nativeOverlay?.SetClickThrough(_settings.ClickThrough);
         _nativeOverlay?.SetInputRegion(_island.PillBounds, RenderScaling, _temporarilyHidden);
         var geometryChanged = previous.WidthPercent != _settings.WidthPercent
@@ -164,6 +231,91 @@ public sealed class OverlayWindow : Window
             Opacity = 1;
         }
     }
+
+    private void AdjustTrackOffset(int delta)
+    {
+        if (!_settings.EnableTrackOffsets || _store.Snapshot.Track is not { } track)
+            return;
+        var current = _settings.TrackOffsetFor(track.Id);
+        var updated = SettingsStore.NormalizeLyricsOffsetMs(current + delta);
+        if (updated != current && !_trackOffsetChanged(track, updated))
+        {
+            (delta > 0 ? _earlierTrackOffsetItem : _laterTrackOffsetItem).Header = "保存失败";
+            return;
+        }
+        RefreshTrackOffsetMenu();
+    }
+
+    private void ResetTrackOffset()
+    {
+        if (_settings.EnableTrackOffsets && _store.Snapshot.Track is { } track
+            && _settings.TrackOffsetFor(track.Id) != 0)
+        {
+            if (!_trackOffsetChanged(track, 0))
+            {
+                _resetTrackOffsetItem.Header = "保存失败";
+                return;
+            }
+        }
+        RefreshTrackOffsetMenu();
+    }
+
+    private void RefreshTrackOffsetMenu()
+    {
+        var track = _store.Snapshot.Track;
+        var trackActionsVisible = _settings.EnableTrackOffsets && track is not null;
+        _trackOffsetSeparator.IsVisible = trackActionsVisible;
+        _earlierTrackOffsetItem.IsVisible = trackActionsVisible;
+        _laterTrackOffsetItem.IsVisible = trackActionsVisible;
+        _earlierTrackOffsetItem.Header = "歌词提前 100 ms";
+        _laterTrackOffsetItem.Header = "歌词延后 100 ms";
+        var offset = _settings.TrackOffsetFor(track?.Id);
+        _earlierTrackOffsetItem.IsEnabled = offset < SettingsStore.MaximumLyricsOffsetMs;
+        _laterTrackOffsetItem.IsEnabled = offset > SettingsStore.MinimumLyricsOffsetMs;
+        _resetTrackOffsetItem.IsVisible = trackActionsVisible && offset != 0;
+        _resetTrackOffsetItem.Header = offset > 0
+            ? $"归零（+{offset} ms）"
+            : $"归零（{offset} ms）";
+    }
+
+    private static MenuItem CreateContextMenuItem(string header)
+    {
+        var highlight = new SolidColorBrush(Color.Parse("#242424"))
+        {
+            Opacity = 0,
+            Transitions = new Transitions
+            {
+                new DoubleTransition
+                {
+                    Property = Brush.OpacityProperty,
+                    Duration = TimeSpan.FromMilliseconds(70)
+                }
+            }
+        };
+        var item = new MenuItem
+        {
+            Header = header,
+            Width = 170,
+            MinHeight = 30,
+            Padding = new Thickness(9, 4),
+            Background = highlight,
+            CornerRadius = new CornerRadius(6),
+            LetterSpacing = 0
+        };
+        item.Resources["MenuFlyoutItemBackground"] = highlight;
+        item.Resources["MenuFlyoutItemBackgroundPointerOver"] = highlight;
+        item.Resources["MenuFlyoutItemBackgroundPressed"] = highlight;
+        item.PointerEntered += (_, _) => highlight.Opacity = item.IsEnabled ? 1 : 0;
+        item.PointerExited += (_, _) => highlight.Opacity = 0;
+        return item;
+    }
+
+    private static Separator CreateMenuSeparator() => new()
+    {
+        Height = 1,
+        Margin = new Thickness(7, 2),
+        Background = MenuBorder
+    };
 
     private void CenterHorizontally()
     {
@@ -234,6 +386,7 @@ public sealed class IslandControl : Control, IDisposable
     private bool _capsuleTransitioning;
     private double _scale = 1d;
     private int _lyricsOffsetMs;
+    private ImmutableDictionary<string, int>? _trackOffsetsMs;
     private bool _showTranslation = true;
     private PausedDisplayMode _pausedDisplay;
     private bool _inactive;
@@ -278,6 +431,7 @@ public sealed class IslandControl : Control, IDisposable
     {
         _scale = Math.Clamp(settings.ScalePercent / 100d, 0.5d, 2d);
         _lyricsOffsetMs = settings.LyricsOffsetMs;
+        _trackOffsetsMs = settings.EnableTrackOffsets ? settings.TrackOffsetsMs : null;
         _showTranslation = settings.ShowTranslation;
         _pausedDisplay = settings.PausedDisplay;
         _renderer.SetBackgroundOpacity(settings.BackgroundOpacityPercent);
@@ -380,7 +534,11 @@ public sealed class IslandControl : Control, IDisposable
         var elapsed = snapshot.IsPlaying
             ? Stopwatch.GetElapsedTime(snapshot.ReportedAtTimestamp).TotalMilliseconds
             : 0d;
-        return ApplyLyricsOffset(snapshot, elapsed, _lyricsOffsetMs);
+        var trackOffset = snapshot.Track is { } track
+            && _trackOffsetsMs?.TryGetValue(track.Id, out var offset) == true
+                ? offset
+                : 0;
+        return ApplyLyricsOffset(snapshot, elapsed, _lyricsOffsetMs + trackOffset);
     }
 
     internal static double ApplyLyricsOffset(PlaybackSnapshot snapshot, double elapsedMs, int offsetMs) =>

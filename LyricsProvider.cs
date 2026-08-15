@@ -12,9 +12,11 @@ namespace LyricifyIsland;
 
 internal static class LyricsProvider
 {
-    public static async Task<ImmutableArray<LyricLine>> LoadAsync(SpotifyTrack track, CancellationToken ct)
+    public static async Task<ImmutableArray<LyricLine>> LoadAsync(
+        SpotifyTrack track,
+        LyricsSourcePreference preference,
+        CancellationToken ct)
     {
-        var lineFallback = ImmutableArray<LyricLine>.Empty;
         var metadata = new TrackMultiArtistMetadata
         {
             Title = track.Title,
@@ -25,6 +27,59 @@ internal static class LyricsProvider
             Isrc = track.Isrc,
         };
 
+        if (preference == LyricsSourcePreference.Automatic)
+        {
+            var netease = await LoadNeteaseAsync(track, metadata, ct);
+            if (netease.WordSynced && !netease.Lines.IsEmpty)
+                return Select(netease);
+
+            var kugou = await LoadKugouAsync(track, metadata, ct);
+            if (!kugou.Lines.IsEmpty)
+                return Select(kugou);
+            if (!netease.Lines.IsEmpty)
+                return Select(netease);
+            return Select(await LoadLrclibAsync(track, metadata, ct));
+        }
+
+        foreach (var source in ProviderOrder(preference))
+        {
+            var result = source switch
+            {
+                LyricsSourcePreference.Netease => await LoadNeteaseAsync(track, metadata, ct),
+                LyricsSourcePreference.Kugou => await LoadKugouAsync(track, metadata, ct),
+                LyricsSourcePreference.Lrclib => await LoadLrclibAsync(track, metadata, ct),
+                _ => throw new InvalidOperationException("无效的歌词源")
+            };
+            if (!result.Lines.IsEmpty)
+                return Select(result);
+        }
+
+        ct.ThrowIfCancellationRequested();
+        return [];
+    }
+
+    internal static IReadOnlyList<LyricsSourcePreference> ProviderOrder(LyricsSourcePreference preference) =>
+        preference switch
+        {
+            LyricsSourcePreference.Kugou =>
+                [LyricsSourcePreference.Kugou, LyricsSourcePreference.Netease, LyricsSourcePreference.Lrclib],
+            LyricsSourcePreference.Lrclib =>
+                [LyricsSourcePreference.Lrclib, LyricsSourcePreference.Netease, LyricsSourcePreference.Kugou],
+            _ => [LyricsSourcePreference.Netease, LyricsSourcePreference.Kugou, LyricsSourcePreference.Lrclib]
+        };
+
+    private static ImmutableArray<LyricLine> Select(ProviderLyrics result)
+    {
+        if (!result.Lines.IsEmpty)
+            Console.Error.WriteLine($"[lyrics] provider={result.Name}");
+        return result.Lines;
+    }
+
+    private static async Task<ProviderLyrics> LoadNeteaseAsync(
+        SpotifyTrack track,
+        ITrackMetadata metadata,
+        CancellationToken ct)
+    {
         try
         {
             ct.ThrowIfCancellationRequested();
@@ -36,26 +91,16 @@ internal static class LyricsProvider
             {
                 var response = await new NeteaseApi().GetLyricNew(match.Id).WaitAsync(providerCt);
                 var yrc = response?.Yrc?.Lyric;
-                var raw = yrc;
-                if (string.IsNullOrWhiteSpace(raw))
-                {
-                    raw = response?.Lrc?.Lyric;
-                }
+                var wordSynced = !string.IsNullOrWhiteSpace(yrc);
+                var raw = wordSynced ? yrc : response?.Lrc?.Lyric;
 
                 if (!string.IsNullOrWhiteSpace(raw))
                 {
                     var translations = ParseTranslation(response?.Ytlrc?.Lyric, response?.Tlyric?.Lyric);
-                    var type = string.IsNullOrWhiteSpace(yrc) ? LyricsRawTypes.Lrc : LyricsRawTypes.Yrc;
+                    var type = wordSynced ? LyricsRawTypes.Yrc : LyricsRawTypes.Lrc;
                     var result = Convert(ParseHelper.ParseLyrics(raw, type), metadata, track.DurationMs, translations);
                     if (!result.IsEmpty)
-                    {
-                        if (type == LyricsRawTypes.Yrc)
-                        {
-                            Console.Error.WriteLine("[lyrics] provider=netease-yrc");
-                            return result;
-                        }
-                        lineFallback = result;
-                    }
+                        return new ProviderLyrics(result, wordSynced ? "netease-yrc" : "netease-lrc", wordSynced);
                 }
             }
         }
@@ -67,7 +112,14 @@ internal static class LyricsProvider
         {
             Console.Error.WriteLine($"[lyrics] netease failed: {exception.Message}");
         }
+        return new ProviderLyrics([], "netease");
+    }
 
+    private static async Task<ProviderLyrics> LoadKugouAsync(
+        SpotifyTrack track,
+        ITrackMetadata metadata,
+        CancellationToken ct)
+    {
         try
         {
             ct.ThrowIfCancellationRequested();
@@ -94,10 +146,7 @@ internal static class LyricsProvider
                             metadata,
                             track.DurationMs);
                         if (!result.IsEmpty)
-                        {
-                            Console.Error.WriteLine("[lyrics] provider=kugou-krc");
-                            return result;
-                        }
+                            return new ProviderLyrics(result, "kugou-krc", WordSynced: true);
                     }
                 }
             }
@@ -110,13 +159,14 @@ internal static class LyricsProvider
         {
             Console.Error.WriteLine($"[lyrics] kugou failed: {exception.Message}");
         }
+        return new ProviderLyrics([], "kugou");
+    }
 
-        if (!lineFallback.IsEmpty)
-        {
-            Console.Error.WriteLine("[lyrics] provider=netease-lrc");
-            return lineFallback;
-        }
-
+    private static async Task<ProviderLyrics> LoadLrclibAsync(
+        SpotifyTrack track,
+        ITrackMetadata metadata,
+        CancellationToken ct)
+    {
         try
         {
             ct.ThrowIfCancellationRequested();
@@ -135,9 +185,7 @@ internal static class LyricsProvider
                     ParseHelper.ParseLyrics(response.SyncedLyrics, LyricsRawTypes.Lrc),
                     metadata,
                     track.DurationMs);
-                if (!result.IsEmpty)
-                    Console.Error.WriteLine("[lyrics] provider=lrclib-lrc");
-                return result;
+                return new ProviderLyrics(result, "lrclib-lrc");
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -150,8 +198,13 @@ internal static class LyricsProvider
         }
 
         ct.ThrowIfCancellationRequested();
-        return [];
+        return new ProviderLyrics([], "lrclib");
     }
+
+    private readonly record struct ProviderLyrics(
+        ImmutableArray<LyricLine> Lines,
+        string Name,
+        bool WordSynced = false);
 
     private static List<ILineInfo>? ParseTranslation(string? preferred, string? fallback)
     {

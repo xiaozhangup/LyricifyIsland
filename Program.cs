@@ -75,6 +75,7 @@ public sealed class App : Application
     private OverlayWindow? _overlay;
     private WindowIcon? _appIcon;
     private PlaybackStore? _store;
+    private SpotifyService? _spotifyService;
     private CancellationTokenSource? _spotifyCancellation;
     private Task? _spotifyTask;
     private IslandSettings _settings = new();
@@ -98,7 +99,8 @@ public sealed class App : Application
             _settings = SettingsStore.Load();
             if (_settings.StartOnLogin)
                 Autostart.SetEnabled(true);
-            _overlay = new OverlayWindow(_store, _settings, SavePosition, () => desktop.Shutdown());
+            _overlay = new OverlayWindow(
+                _store, _settings, SavePosition, UpdateTrackOffset, ShowSettings, () => desktop.Shutdown());
             desktop.MainWindow = _overlay;
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             CreateTrayIcon(desktop);
@@ -151,13 +153,19 @@ public sealed class App : Application
             return;
         }
 
-        _settingsWindow = new SettingsWindow(_settings, _appIcon!, ApplySettings);
+        _settingsWindow = new SettingsWindow(
+            _settings,
+            _appIcon!,
+            ApplySettings,
+            () => _settings,
+            RefreshCurrentTrack);
         _settingsWindow.Closed += (_, _) => _settingsWindow = null;
         _settingsWindow.Show();
     }
 
     private bool ApplySettings(IslandSettings settings, bool reconnectSpotify)
     {
+        var previous = _settings;
         if (settings.RememberPosition && _settings.RememberPosition)
             settings = settings with { WindowX = _settings.WindowX, WindowY = _settings.WindowY };
         settings = SettingsStore.Normalize(settings);
@@ -173,10 +181,24 @@ public sealed class App : Application
 
         _settings = settings;
         _overlay?.ApplySettings(_settings);
+        if (Volatile.Read(ref _spotifyService) is { } spotify)
+        {
+            spotify.SetLyricsSource(_settings.LyricsSource);
+            if (previous.LyricsSource != _settings.LyricsSource)
+                spotify.RequestCurrentTrackRefresh();
+        }
         if (reconnectSpotify && !Program.Options.Demo)
             _ = RestartSpotifyAsync();
         return true;
     }
+
+    private bool RefreshCurrentTrack() =>
+        Volatile.Read(ref _spotifyService)?.RequestCurrentTrackRefresh() == true;
+
+    private bool UpdateTrackOffset(TrackInfo track, int offsetMs) =>
+        ApplySettings(
+            offsetMs == 0 ? _settings.RemoveTrackOffset(track.Id) : _settings.WithTrackOffset(track, offsetMs),
+            reconnectSpotify: false);
 
     private void SavePosition(PixelPoint position)
     {
@@ -206,6 +228,7 @@ public sealed class App : Application
             _spotifyCancellation?.Dispose();
             _spotifyCancellation = null;
             _spotifyTask = null;
+            Volatile.Write(ref _spotifyService, null);
 
             if (_shutdown.IsCancellationRequested)
                 return;
@@ -224,8 +247,10 @@ public sealed class App : Application
             var cancellationToken = _spotifyCancellation.Token;
             var clientId = _settings.SpotifyClientId;
             var clientSecret = _settings.SpotifyClientSecret;
-            _spotifyTask = Task.Run(() =>
-                new SpotifyService(_store, clientId, clientSecret).RunAsync(cancellationToken));
+            var spotify = new SpotifyService(
+                _store, clientId, clientSecret, _settings.LyricsSource);
+            Volatile.Write(ref _spotifyService, spotify);
+            _spotifyTask = Task.Run(() => spotify.RunAsync(cancellationToken));
         }
         finally
         {
@@ -463,6 +488,33 @@ internal static class SelfCheck
             "Spotify credential settings");
         Require(!(configured with { SpotifyClientSecret = string.Empty }).HasSpotifyCredentials,
             "incomplete Spotify credential settings");
+        var trackOffsets = (configured with { EnableTrackOffsets = true }).WithTrackOffset(track, 350);
+        var zeroedTrackOffsets = trackOffsets.WithTrackOffset(track, 0);
+        var removedTrackOffsets = zeroedTrackOffsets.RemoveTrackOffset(track.Id);
+        Require(trackOffsets.TrackOffsetFor(track.Id) == 350
+                && trackOffsets.TrackOffsetFor("other") == 0
+                && trackOffsets.TrackOffsetTitleFor(track.Id).StartsWith(track.Title, StringComparison.Ordinal)
+                && (trackOffsets with { EnableTrackOffsets = false }).TrackOffsetFor(track.Id) == 350
+                && zeroedTrackOffsets.TrackOffsetsMs?.ContainsKey(track.Id) == true
+                && zeroedTrackOffsets.TrackOffsetFor(track.Id) == 0
+                && zeroedTrackOffsets.TrackOffsetTitleFor(track.Id).StartsWith(track.Title, StringComparison.Ordinal)
+                && removedTrackOffsets.TrackOffsetsMs is null
+                && removedTrackOffsets.TrackOffsetTitles is null,
+            "per-track lyrics offset");
+        Require(LyricsProvider.ProviderOrder(LyricsSourcePreference.Kugou)
+                    .SequenceEqual([
+                        LyricsSourcePreference.Kugou,
+                        LyricsSourcePreference.Netease,
+                        LyricsSourcePreference.Lrclib])
+                && LyricsProvider.ProviderOrder(LyricsSourcePreference.Lrclib)[0]
+                    == LyricsSourcePreference.Lrclib,
+            "lyrics provider preference");
+        var refreshStore = new PlaybackStore();
+        var refreshService = new SpotifyService(
+            refreshStore, string.Empty, string.Empty, LyricsSourcePreference.Automatic);
+        Require(!refreshService.RequestCurrentTrackRefresh(), "refresh without current track");
+        refreshStore.Update(previousPlayback);
+        Require(refreshService.RequestCurrentTrackRefresh(), "refresh current track request");
         CheckSettingsStore();
         CheckTrackCache(track);
         Require(OverlayWindow.CalculateLogicalHeight(150d) == 174d, "island height scaling");
@@ -513,9 +565,23 @@ internal static class SelfCheck
                 true,
                 "display-id",
                 123,
-                456);
+                456) with
+            {
+                LyricsSource = LyricsSourcePreference.Kugou,
+                EnableTrackOffsets = true
+            };
+            expected = expected.WithTrackOffset("track-a", "测试歌曲 — 测试歌手", -275);
+            expected = expected.WithTrackOffset("track-zero", "零偏移歌曲", 0);
             Require(SettingsStore.Save(expected), "settings save");
-            Require(SettingsStore.Load() == expected, "settings round trip");
+            var loaded = SettingsStore.Load();
+            Require(loaded with { TrackOffsetsMs = null, TrackOffsetTitles = null }
+                        == expected with { TrackOffsetsMs = null, TrackOffsetTitles = null }
+                    && loaded.TrackOffsetFor("track-a") == -275
+                    && loaded.TrackOffsetTitleFor("track-a") == "测试歌曲 — 测试歌手"
+                    && loaded.TrackOffsetsMs?.ContainsKey("track-zero") == true
+                    && loaded.TrackOffsetFor("track-zero") == 0
+                    && loaded.TrackOffsetTitleFor("track-zero") == "零偏移歌曲",
+                "settings round trip");
             if (!OperatingSystem.IsWindows())
             {
                 var directory = Path.Combine(configHome, "lyricify-island");

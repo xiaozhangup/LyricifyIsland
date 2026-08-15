@@ -29,11 +29,30 @@ internal sealed class SpotifyService
     private long _crossfadeOffsetMs;
     private int _positionSyncVersion;
     private int _positionSyncedVersion;
+    private int _lyricsSource;
+    private int _refreshCurrentTrack;
 
-    public SpotifyService(PlaybackStore store, string clientId, string clientSecret)
+    public SpotifyService(
+        PlaybackStore store,
+        string clientId,
+        string clientSecret,
+        LyricsSourcePreference lyricsSource)
     {
         _store = store;
         _credentials = new Credentials(clientId, clientSecret);
+        _lyricsSource = (int)lyricsSource;
+    }
+
+    public void SetLyricsSource(LyricsSourcePreference source) =>
+        Volatile.Write(ref _lyricsSource, (int)source);
+
+    public bool RequestCurrentTrackRefresh()
+    {
+        if (_store.Snapshot.Track is null)
+            return false;
+        if (Interlocked.Exchange(ref _refreshCurrentTrack, 1) == 0)
+            _pollWake.Release();
+        return true;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -181,18 +200,21 @@ internal sealed class SpotifyService
             if (reportedPosition.HasValue && playbackStateTimestamp != 0)
                 _lastPlaybackStateTimestamp = playbackStateTimestamp;
 
+            var forceTrackRefresh = Interlocked.Exchange(ref _refreshCurrentTrack, 0) != 0;
             var currentTrack = Volatile.Read(ref _track);
-            if (currentTrack?.Id != spotifyTrack.Id)
+            if (currentTrack?.Id != spotifyTrack.Id || forceTrackRefresh)
             {
                 CancelTrackLoad();
-                currentTrack = TrackCache.Load(spotifyTrack.Id) ?? new TrackInfo(
-                    spotifyTrack.Id,
-                    spotifyTrack.Title,
-                    spotifyTrack.Artists,
-                    spotifyTrack.Album,
-                    spotifyTrack.DurationMs,
-                    [],
-                    []);
+                currentTrack = forceTrackRefresh && currentTrack?.Id == spotifyTrack.Id
+                    ? currentTrack
+                    : TrackCache.Load(spotifyTrack.Id) ?? new TrackInfo(
+                        spotifyTrack.Id,
+                        spotifyTrack.Title,
+                        spotifyTrack.Artists,
+                        spotifyTrack.Album,
+                        spotifyTrack.DurationMs,
+                        [],
+                        []);
                 Volatile.Write(ref _track, currentTrack);
                 Volatile.Write(ref _loadingTrack, currentTrack);
                 _store.Update(new PlaybackSnapshot(currentTrack, position, reportedAt, isPlaying,
@@ -685,13 +707,14 @@ internal sealed class SpotifyService
         return smallest;
     }
 
-    private static async Task<ImmutableArray<LyricLine>> LoadLyricsSafeAsync(
+    private async Task<ImmutableArray<LyricLine>> LoadLyricsSafeAsync(
         SpotifyTrack track,
         CancellationToken cancellationToken)
     {
         try
         {
-            return await LyricsProvider.LoadAsync(track, cancellationToken);
+            var source = (LyricsSourcePreference)Volatile.Read(ref _lyricsSource);
+            return await LyricsProvider.LoadAsync(track, source, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
