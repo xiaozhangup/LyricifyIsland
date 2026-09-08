@@ -30,6 +30,12 @@ public sealed class OverlayWindow : Window
     private readonly Action<PixelPoint> _positionChanged;
     private readonly Func<TrackInfo, int, bool> _trackOffsetChanged;
     private readonly MenuItem _hideItem;
+    private readonly MenuItem _bannerItem;
+    private TrackInfo? _bannerTrack;
+    private LyricLine? _bannerLine;
+    private string? _bannerSpotifyUrl;
+    private bool _bannerTranslation;
+    private BannerWindow? _bannerWindow;
     private readonly MenuItem _earlierTrackOffsetItem;
     private readonly MenuItem _laterTrackOffsetItem;
     private readonly MenuItem _resetTrackOffsetItem;
@@ -86,6 +92,8 @@ public sealed class OverlayWindow : Window
 
         _hideItem = CreateContextMenuItem(HideLabel(_settings.TemporaryHideSeconds));
         _hideItem.Click += (_, _) => _ = HideTemporarilyAsync();
+        _bannerItem = CreateContextMenuItem("复制歌曲分享图…");
+        _bannerItem.Click += (_, _) => ShowBanner();
         _earlierTrackOffsetItem = CreateContextMenuItem("歌词提前 100 ms");
         _earlierTrackOffsetItem.StaysOpenOnClick = true;
         _earlierTrackOffsetItem.Click += (_, _) => AdjustTrackOffset(100);
@@ -108,6 +116,7 @@ public sealed class OverlayWindow : Window
             {
                 _hideItem,
                 center,
+                _bannerItem,
                 _trackOffsetSeparator,
                 _earlierTrackOffsetItem,
                 _laterTrackOffsetItem,
@@ -138,7 +147,18 @@ public sealed class OverlayWindow : Window
         contextMenu.Resources["MenuFlyoutItemForegroundPointerOver"] = MenuForeground;
         contextMenu.Resources["MenuFlyoutItemForegroundPressed"] = MenuForeground;
         contextMenu.Resources["MenuFlyoutItemForegroundDisabled"] = MenuDisabled;
-        contextMenu.Opening += (_, _) => RefreshTrackOffsetMenu();
+        contextMenu.Opening += (_, _) =>
+        {
+            RefreshTrackOffsetMenu();
+            var snapshot = _store.Snapshot;
+            _bannerTrack = snapshot.Track;
+            var lineIndex = IslandControl.FindLine(_bannerTrack?.Lyrics, _island.CurrentPosition(snapshot));
+            _bannerLine = lineIndex >= 0 ? _bannerTrack!.Lyrics[lineIndex] : null;
+            _bannerTranslation = _settings.ShowTranslation;
+            _bannerSpotifyUrl = _bannerTrack is null ? null
+                : SongBanner.SpotifyUrl(_bannerTrack.Id, _settings.PlaybackSource);
+            _bannerItem.IsEnabled = _bannerTrack is not null;
+        };
         _island.ContextMenu = contextMenu;
         RefreshTrackOffsetMenu();
         Content = _island;
@@ -173,6 +193,7 @@ public sealed class OverlayWindow : Window
         Closed += (_, _) =>
         {
             _closed = true;
+            _bannerWindow?.Close();
             _positionSaveTimer.Stop();
             Screens.Changed -= ScreensChanged;
             _nativeOverlay?.Dispose();
@@ -244,6 +265,22 @@ public sealed class OverlayWindow : Window
             return;
         }
         RefreshTrackOffsetMenu();
+    }
+
+    private void ShowBanner()
+    {
+        if (_bannerWindow is not null)
+        {
+            if (_bannerWindow.WindowState == WindowState.Minimized)
+                _bannerWindow.WindowState = WindowState.Normal;
+            _bannerWindow.Activate();
+            return;
+        }
+        if (_bannerTrack is not { } track)
+            return;
+        _bannerWindow = new BannerWindow(track, _bannerLine, _bannerTranslation, _bannerSpotifyUrl);
+        _bannerWindow.Closed += (_, _) => _bannerWindow = null;
+        _bannerWindow.Show();
     }
 
     private void ResetTrackOffset()
@@ -481,7 +518,7 @@ public sealed class IslandControl : Control, IDisposable
         var now = Stopwatch.GetTimestamp();
         var requiresAttention = PlaybackStore.RequiresAttention(snapshot.Status);
         var inactive = !requiresAttention && (track is not null && !snapshot.IsPlaying
-            || track is null && snapshot.Status == PlaybackStore.NoActiveSpotifyPlaybackStatus);
+            || track is null && PlaybackStore.IsNoActivePlayback(snapshot.Status));
         if (inactive != _inactive)
         {
             _inactive = inactive;
@@ -529,10 +566,10 @@ public sealed class IslandControl : Control, IDisposable
             new Rect(Bounds.Size), _renderer, frame, fullPillBounds, pillBounds));
     }
 
-    private double CurrentPosition(PlaybackSnapshot snapshot)
+    internal double CurrentPosition(PlaybackSnapshot snapshot)
     {
         var elapsed = snapshot.IsPlaying
-            ? Stopwatch.GetElapsedTime(snapshot.ReportedAtTimestamp).TotalMilliseconds
+            ? Stopwatch.GetElapsedTime(snapshot.ReportedAtTimestamp).TotalMilliseconds * snapshot.PlaybackRate
             : 0d;
         var trackOffset = snapshot.Track is { } track
             && _trackOffsetsMs?.TryGetValue(track.Id, out var offset) == true
@@ -545,7 +582,7 @@ public sealed class IslandControl : Control, IDisposable
         Math.Clamp(
             snapshot.ReportedPositionMs + elapsedMs + offsetMs,
             0d,
-            snapshot.Track?.DurationMs ?? double.MaxValue);
+            snapshot.Track is { DurationMs: > 0 } track ? track.DurationMs : double.MaxValue);
 
     internal static bool ShouldShowCapsule(
         bool inactive,
@@ -1078,7 +1115,7 @@ internal sealed class IslandRenderer : IDisposable
         MainFontSet mainFonts,
         SKFont translationFont)
     {
-        var title = frame.Track?.Title ?? frame.Status ?? "等待 Spotify";
+        var title = frame.Track?.Title ?? frame.Status ?? "等待播放信息";
         var subtitle = StatusSubtitle(frame.Track, frame.Status);
         var titleLayout = LayoutMainText(title, mainFonts);
         var subtitleWidth = translationFont.MeasureText(subtitle);
@@ -1095,7 +1132,7 @@ internal sealed class IslandRenderer : IDisposable
         SKFont translationFont,
         bool showTranslation)
     {
-        var main = line?.Text ?? track?.Title ?? status ?? "等待 Spotify";
+        var main = line?.Text ?? track?.Title ?? status ?? "等待播放信息";
         var sub = line is null
             ? StatusSubtitle(track, status)
             : showTranslation ? line.Translation ?? string.Empty : string.Empty;
@@ -1103,11 +1140,16 @@ internal sealed class IslandRenderer : IDisposable
         return Math.Max(content + 146f, 390f);
     }
 
-    private static string StatusSubtitle(TrackInfo? track, string? status) => track is null
-        ? status == PlaybackStore.MissingSpotifyCredentialsStatus
-            ? "托盘菜单 → 设置 → Spotify"
-            : "首次启动会打开浏览器授权"
-        : status ?? string.Join(", ", track.Artists);
+    private static string StatusSubtitle(TrackInfo? track, string? status)
+    {
+        if (track is not null)
+            return status ?? string.Join(", ", track.Artists);
+        if (status == PlaybackStore.MissingSpotifyCredentialsStatus)
+            return "托盘菜单 → 设置 → 播放信息源";
+        return status?.Contains("MPRIS", StringComparison.Ordinal) == true
+            ? "读取本机播放器的 MPRIS 信息"
+            : "首次使用 Spotify 会打开浏览器授权";
+    }
 
     internal static float DesiredPillHeight(LyricLine? line, bool showTranslation = true) =>
         line is not null && (!showTranslation || string.IsNullOrWhiteSpace(line.Translation))

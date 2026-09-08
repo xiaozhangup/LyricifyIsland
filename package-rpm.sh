@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-version="${1:-0.1.3}"
+version="${1:-0.1.4}"
 topdir="$(mktemp -d)"
 trap 'rm -rf -- "$topdir"' EXIT
 
@@ -20,14 +20,14 @@ cat >"$topdir/SPECS/lyricify-island.spec" <<EOF
 Name:           lyricify-island
 Version:        $version
 Release:        1%{?dist}
-Summary:        Spotify desktop lyrics island
+Summary:        Desktop lyrics island for Spotify and MPRIS
 License:        MIT AND Apache-2.0
 URL:            https://github.com/xiaozhangup/LyricifyIsland
 BuildArch:      x86_64
 Requires:       libX11, libXfixes
 
 %description
-Desktop topmost lyrics island for Spotify.
+Desktop topmost lyrics island for Spotify and local MPRIS players.
 
 %install
 install -Dm755 %{_sourcedir}/LyricifyIsland %{buildroot}%{_bindir}/LyricifyIsland

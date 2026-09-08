@@ -24,6 +24,12 @@ internal enum LyricsSourcePreference
     Lrclib
 }
 
+internal enum PlaybackSourcePreference
+{
+    Spotify,
+    Mpris
+}
+
 internal readonly record struct IslandSettings(
     double WidthPercent = SettingsStore.DefaultWidthPercent,
     double ScalePercent = SettingsStore.DefaultScalePercent,
@@ -45,7 +51,8 @@ internal readonly record struct IslandSettings(
     LyricsSourcePreference LyricsSource = LyricsSourcePreference.Automatic,
     bool EnableTrackOffsets = false,
     ImmutableDictionary<string, int>? TrackOffsetsMs = null,
-    ImmutableDictionary<string, string>? TrackOffsetTitles = null)
+    ImmutableDictionary<string, string>? TrackOffsetTitles = null,
+    PlaybackSourcePreference PlaybackSource = PlaybackSourcePreference.Spotify)
 {
     public bool HasSpotifyCredentials =>
         !string.IsNullOrWhiteSpace(SpotifyClientId)
@@ -146,7 +153,8 @@ internal static class SettingsStore
                 data?.LyricsSource ?? LyricsSourcePreference.Automatic,
                 data?.EnableTrackOffsets ?? data?.TrackOffsetsMs is { Count: > 0 },
                 data?.TrackOffsetsMs?.ToImmutableDictionary(StringComparer.Ordinal),
-                data?.TrackOffsetTitles?.ToImmutableDictionary(StringComparer.Ordinal)));
+                data?.TrackOffsetTitles?.ToImmutableDictionary(StringComparer.Ordinal),
+                data?.PlaybackSource ?? PlaybackSourcePreference.Spotify));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -191,7 +199,8 @@ internal static class SettingsStore
                     LyricsSource = settings.LyricsSource,
                     EnableTrackOffsets = settings.EnableTrackOffsets,
                     TrackOffsetsMs = settings.TrackOffsetsMs?.ToDictionary(),
-                    TrackOffsetTitles = settings.TrackOffsetTitles?.ToDictionary()
+                    TrackOffsetTitles = settings.TrackOffsetTitles?.ToDictionary(),
+                    PlaybackSource = settings.PlaybackSource
                 }));
             Secure(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             File.Move(temporary, path, overwrite: true);
@@ -249,6 +258,9 @@ internal static class SettingsStore
             LyricsSource = Enum.IsDefined(settings.LyricsSource)
                 ? settings.LyricsSource
                 : LyricsSourcePreference.Automatic,
+            PlaybackSource = Enum.IsDefined(settings.PlaybackSource)
+                ? settings.PlaybackSource
+                : PlaybackSourcePreference.Spotify,
             TemporaryHideSeconds = NormalizeTemporaryHideSeconds(settings.TemporaryHideSeconds),
             DisplayId = string.IsNullOrWhiteSpace(settings.DisplayId) ? null : settings.DisplayId.Trim(),
             WindowX = settings.RememberPosition ? settings.WindowX : null,
@@ -333,6 +345,7 @@ internal static class SettingsStore
         public bool? EnableTrackOffsets { get; init; }
         public Dictionary<string, int>? TrackOffsetsMs { get; init; }
         public Dictionary<string, string>? TrackOffsetTitles { get; init; }
+        public PlaybackSourcePreference? PlaybackSource { get; init; }
     }
 }
 
@@ -424,7 +437,7 @@ internal sealed class SettingsWindow : Window
 
         bool Commit(
             IslandSettings updated,
-            bool reconnectSpotify = false,
+            bool restartPlayback = false,
             bool trackOffsetsChanged = false)
         {
             if (!trackOffsetsChanged)
@@ -437,7 +450,7 @@ internal sealed class SettingsWindow : Window
                 };
             }
             updated = SettingsStore.Normalize(updated);
-            if (!settingsChanged(updated, reconnectSpotify))
+            if (!settingsChanged(updated, restartPlayback))
                 return false;
             settings = updated;
             return true;
@@ -973,7 +986,7 @@ internal sealed class SettingsWindow : Window
             }
 
             var updated = settings with { SpotifyClientId = id, SpotifyClientSecret = secret };
-            if (!Commit(updated, reconnectSpotify: true))
+            if (!Commit(updated, restartPlayback: true))
             {
                 credentialStatus.Text = "保存失败，请查看终端错误";
                 return;
@@ -1014,11 +1027,57 @@ internal sealed class SettingsWindow : Window
                 credentialActions
             }
         };
-        var spotify = CreateCard(
+        var playbackSourceChoices = new[]
+        {
+            new Choice<PlaybackSourcePreference>(PlaybackSourcePreference.Spotify, "Spotify"),
+            new Choice<PlaybackSourcePreference>(PlaybackSourcePreference.Mpris, "本地 MPRIS")
+        };
+        var playbackSourceStatus = new TextBlock
+        {
+            Foreground = MutedText,
+            FontSize = 12
+        };
+        var resettingPlaybackSource = false;
+        ComboBox playbackSourceChoice = null!;
+        playbackSourceChoice = CreateChoice(
+            "播放信息源",
+            playbackSourceChoices,
+            playbackSourceChoices.First(choice => choice.Value == settings.PlaybackSource),
+            value =>
+            {
+                if (resettingPlaybackSource)
+                    return;
+                var previous = settings.PlaybackSource;
+                if (Commit(settings with { PlaybackSource = value }))
+                {
+                    spotifyForm.IsVisible = value == PlaybackSourcePreference.Spotify;
+                    playbackSourceStatus.Text = string.Empty;
+                    return;
+                }
+
+                resettingPlaybackSource = true;
+                playbackSourceChoice.SelectedItem = playbackSourceChoices
+                    .First(choice => choice.Value == previous);
+                resettingPlaybackSource = false;
+                playbackSourceStatus.Text = "保存失败，请查看终端错误";
+            });
+        spotifyForm.IsVisible = settings.PlaybackSource == PlaybackSourcePreference.Spotify;
+        var playbackSource = CreateCard(
             MusicIcon,
-            "Spotify",
-            "用于读取当前播放状态，Client Secret 会遮蔽显示",
-            body: spotifyForm);
+            "播放信息源",
+            "选择 Spotify Web API 或本机播放器提供的 MPRIS 信息",
+            body: new StackPanel
+            {
+                Children =
+                {
+                    CreateSettingsBody(CreateSettingRow(
+                        "当前来源",
+                        "MPRIS 不需要 Spotify 参数",
+                        playbackSourceChoice),
+                    playbackSourceStatus),
+                    spotifyForm
+                }
+            });
 
         var cacheStatus = new TextBlock
         {
@@ -1055,7 +1114,7 @@ internal sealed class SettingsWindow : Window
                 Margin = new Thickness(10),
                 Spacing = 8,
                 HorizontalAlignment = HorizontalAlignment.Stretch,
-                Children = { appearance, lyrics, position, behavior, spotify, cache }
+                Children = { appearance, lyrics, position, behavior, playbackSource, cache }
             }
         };
     }

@@ -1,11 +1,27 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Collections.Immutable;
+using SkiaSharp;
 
 namespace LyricifyIsland;
 
 internal static class TrackCache
 {
+    internal static ImmutableArray<byte> PreferLargerImage(ImmutableArray<byte> current, ImmutableArray<byte> incoming)
+    {
+        static long Area(ImmutableArray<byte> bytes)
+        {
+            if (bytes.IsDefaultOrEmpty)
+                return 0;
+            using var data = SKData.CreateCopy(bytes.AsSpan());
+            using var codec = SKCodec.Create(data);
+            return codec is null ? 0 : (long)codec.Info.Width * codec.Info.Height;
+        }
+        var incomingArea = Area(incoming);
+        return incomingArea > 0 && incomingArea >= Area(current) ? incoming : current;
+    }
+
     public static TrackInfo? Load(string id)
     {
         try

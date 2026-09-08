@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=Lyricify Island
-Comment=Spotify desktop lyrics island
-Comment[zh_CN]=Spotify 桌面歌词岛
+Comment=Desktop lyrics island for Spotify and MPRIS
+Comment[zh_CN]=支持 Spotify 与 MPRIS 的桌面歌词岛
 Exec=LyricifyIsland
 Icon=lyricify-island
 Terminal=false

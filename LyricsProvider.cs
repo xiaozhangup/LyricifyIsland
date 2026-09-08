@@ -13,7 +13,7 @@ namespace LyricifyIsland;
 internal static class LyricsProvider
 {
     public static async Task<ImmutableArray<LyricLine>> LoadAsync(
-        SpotifyTrack track,
+        SourceTrack track,
         LyricsSourcePreference preference,
         CancellationToken ct)
     {
@@ -76,7 +76,7 @@ internal static class LyricsProvider
     }
 
     private static async Task<ProviderLyrics> LoadNeteaseAsync(
-        SpotifyTrack track,
+        SourceTrack track,
         ITrackMetadata metadata,
         CancellationToken ct)
     {
@@ -116,7 +116,7 @@ internal static class LyricsProvider
     }
 
     private static async Task<ProviderLyrics> LoadKugouAsync(
-        SpotifyTrack track,
+        SourceTrack track,
         ITrackMetadata metadata,
         CancellationToken ct)
     {
@@ -163,7 +163,7 @@ internal static class LyricsProvider
     }
 
     private static async Task<ProviderLyrics> LoadLrclibAsync(
-        SpotifyTrack track,
+        SourceTrack track,
         ITrackMetadata metadata,
         CancellationToken ct)
     {

@@ -9,7 +9,7 @@ using System.Text.Json;
 
 namespace LyricifyIsland;
 
-internal sealed class SpotifyService
+internal sealed class SpotifyService : IPlaybackSource
 {
     private const string RedirectUri = "http://127.0.0.1:43821/callback";
     private const string Scope = "user-read-currently-playing user-read-playback-state";
@@ -202,7 +202,8 @@ internal sealed class SpotifyService
 
             var forceTrackRefresh = Interlocked.Exchange(ref _refreshCurrentTrack, 0) != 0;
             var currentTrack = Volatile.Read(ref _track);
-            if (currentTrack?.Id != spotifyTrack.Id || forceTrackRefresh)
+            if (currentTrack?.Id != spotifyTrack.Id || forceTrackRefresh
+                || currentTrack?.AlbumArtUrl != spotifyTrack.AlbumArtUrl)
             {
                 CancelTrackLoad();
                 currentTrack = forceTrackRefresh && currentTrack?.Id == spotifyTrack.Id
@@ -215,6 +216,7 @@ internal sealed class SpotifyService
                         spotifyTrack.DurationMs,
                         [],
                         []);
+                currentTrack = currentTrack with { AlbumArtUrl = spotifyTrack.AlbumArtUrl };
                 Volatile.Write(ref _track, currentTrack);
                 Volatile.Write(ref _loadingTrack, currentTrack);
                 _store.Update(new PlaybackSnapshot(currentTrack, position, reportedAt, isPlaying,
@@ -237,7 +239,7 @@ internal sealed class SpotifyService
     }
 
     private async Task CompleteTrackAsync(
-        SpotifyTrack spotifyTrack,
+        SourceTrack spotifyTrack,
         TrackInfo placeholder,
         CancellationToken cancellationToken)
     {
@@ -280,7 +282,7 @@ internal sealed class SpotifyService
                 var loadedLyrics = published.Lyrics.IsDefaultOrEmpty && !lyrics.IsDefaultOrEmpty;
                 var didPublish = Publish(published with
                 {
-                    AlbumArtBytes = album.IsEmpty ? published.AlbumArtBytes : album,
+                    AlbumArtBytes = TrackCache.PreferLargerImage(published.AlbumArtBytes, album),
                     Lyrics = lyrics.IsEmpty ? published.Lyrics : lyrics
                 });
                 Interlocked.CompareExchange(ref _loadingTrack, null, published);
@@ -383,7 +385,7 @@ internal sealed class SpotifyService
         return enabled ? Math.Clamp(duration, 0, 12_000) : 0;
     }
 
-    private static int ReadSpotifyCrossfadeMs()
+    internal static int ReadSpotifyCrossfadeMs()
     {
         var configHome = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME");
         if (string.IsNullOrWhiteSpace(configHome) || !Path.IsPathRooted(configHome))
@@ -421,7 +423,8 @@ internal sealed class SpotifyService
     {
         var sameTrack = previous.Track?.Id == trackId;
         var elapsed = sameTrack && previous.IsPlaying
-            ? Math.Max(0L, (long)Stopwatch.GetElapsedTime(previous.ReportedAtTimestamp, reportedAt).TotalMilliseconds)
+            ? Math.Max(0L, (long)(Stopwatch.GetElapsedTime(previous.ReportedAtTimestamp, reportedAt)
+                .TotalMilliseconds * previous.PlaybackRate))
             : 0L;
         var predicted = Math.Max(0L, previous.ReportedPositionMs + elapsed);
         if (reportedPosition is null)
@@ -639,7 +642,7 @@ internal sealed class SpotifyService
         }
     }
 
-    private static SpotifyTrack? ParseTrack(JsonElement item)
+    private static SourceTrack? ParseTrack(JsonElement item)
     {
         var title = GetString(item, "name");
         if (string.IsNullOrWhiteSpace(title))
@@ -655,7 +658,7 @@ internal sealed class SpotifyService
         {
             albumName = GetString(album, "name") ?? string.Empty;
             albumArtists = Names(album, "artists");
-            albumArtUrl = SmallestImage(album);
+            albumArtUrl = ImageUrl(album, largest: true);
         }
 
         string? isrc = null;
@@ -665,7 +668,7 @@ internal sealed class SpotifyService
 
         var id = GetString(item, "id") ?? GetString(item, "uri")
             ?? $"local:{title}:{duration}:{string.Join(',', artists)}";
-        return new SpotifyTrack(
+        return new SourceTrack(
             id, title, artists, artistIds, albumArtists, albumName, duration, isrc, albumArtUrl);
     }
 
@@ -683,13 +686,13 @@ internal sealed class SpotifyService
             .ToImmutableArray();
     }
 
-    private static string? SmallestImage(JsonElement parent)
+    private static string? ImageUrl(JsonElement parent, bool largest = false)
     {
         if (!parent.TryGetProperty("images", out var images) || images.ValueKind != JsonValueKind.Array)
             return null;
 
-        string? smallest = null;
-        var smallestArea = long.MaxValue;
+        string? selected = null;
+        var selectedArea = largest ? long.MinValue : long.MaxValue;
         foreach (var image in images.EnumerateArray())
         {
             var url = GetString(image, "url");
@@ -697,18 +700,18 @@ internal sealed class SpotifyService
                 continue;
             var width = GetInt64(image, "width");
             var height = GetInt64(image, "height");
-            var area = width > 0 && height > 0 ? width * height : long.MaxValue - 1;
-            if (area < smallestArea)
+            var area = width > 0 && height > 0 ? width * height : largest ? 0 : long.MaxValue - 1;
+            if (largest ? area > selectedArea : area < selectedArea)
             {
-                smallest = url;
-                smallestArea = area;
+                selected = url;
+                selectedArea = area;
             }
         }
-        return smallest;
+        return selected;
     }
 
     private async Task<ImmutableArray<LyricLine>> LoadLyricsSafeAsync(
-        SpotifyTrack track,
+        SourceTrack track,
         CancellationToken cancellationToken)
     {
         try
@@ -757,7 +760,7 @@ internal sealed class SpotifyService
 
             await using var body = await response.Content.ReadAsStreamAsync(timeout.Token);
             using var json = await JsonDocument.ParseAsync(body, cancellationToken: timeout.Token);
-            return await LoadImageSafeAsync(SmallestImage(json.RootElement), timeout.Token);
+            return await LoadImageSafeAsync(ImageUrl(json.RootElement), timeout.Token);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -769,17 +772,26 @@ internal sealed class SpotifyService
         }
     }
 
-    private static async Task<ImmutableArray<byte>> LoadImageSafeAsync(
+    internal static async Task<ImmutableArray<byte>> LoadImageSafeAsync(
         string? url,
         CancellationToken cancellationToken)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
-            || uri.Scheme is not ("http" or "https"))
+            || uri.Scheme is not ("file" or "http" or "https"))
             return ImmutableArray<byte>.Empty;
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(15));
+            if (uri.IsFile)
+            {
+                await using var stream = File.OpenRead(uri.LocalPath);
+                if (stream.Length is <= 0 or > 10 * 1024 * 1024)
+                    return [];
+                var bytes = new byte[stream.Length];
+                await stream.ReadExactlyAsync(bytes, timeout.Token);
+                return bytes.ToImmutableArray();
+            }
             return (await Http.GetByteArrayAsync(uri, timeout.Token)).ToImmutableArray();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

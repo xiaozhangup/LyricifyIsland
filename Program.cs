@@ -9,6 +9,7 @@ using Avalonia.Styling;
 using Avalonia.Themes.Fluent;
 using Avalonia.Threading;
 using SkiaSharp;
+using Tmds.DBus.Protocol;
 
 namespace LyricifyIsland;
 
@@ -37,6 +38,16 @@ internal static class Program
         Options = LaunchOptions.Parse(args);
         if (args.Contains("--self-test"))
             return SelfCheck.Run();
+        if (Options.SnapshotPath is { } bannerPath && args.Contains("--banner"))
+        {
+            BuildAvaloniaApp().SetupWithoutStarting();
+            var track = DemoSource.Track;
+            var png = SongBanner.Render(track, track.Lyrics[0], args.Contains("--portrait"), true, null);
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(bannerPath))!);
+            File.WriteAllBytes(bannerPath, png);
+            Console.WriteLine(Path.GetFullPath(bannerPath));
+            return 0;
+        }
         if (Options.SnapshotPath is not null)
             return WriteSnapshot(Options.SnapshotPath);
 
@@ -69,15 +80,15 @@ internal static class Program
 public sealed class App : Application
 {
     private readonly CancellationTokenSource _shutdown = new();
-    private readonly SemaphoreSlim _spotifyRestart = new(1, 1);
+    private readonly SemaphoreSlim _playbackRestart = new(1, 1);
     private TrayIcon? _trayIcon;
     private SettingsWindow? _settingsWindow;
     private OverlayWindow? _overlay;
     private WindowIcon? _appIcon;
     private PlaybackStore? _store;
-    private SpotifyService? _spotifyService;
-    private CancellationTokenSource? _spotifyCancellation;
-    private Task? _spotifyTask;
+    private IPlaybackSource? _playbackSource;
+    private CancellationTokenSource? _playbackCancellation;
+    private Task? _playbackTask;
     private IslandSettings _settings = new();
 
     public override void Initialize()
@@ -108,7 +119,7 @@ public sealed class App : Application
             if (Program.Options.Demo)
                 _ = DemoSource.RunAsync(_store, _shutdown.Token);
             else
-                _ = RestartSpotifyAsync();
+                _ = RestartPlaybackAsync();
 
             if (Program.Options.ExitAfterSeconds is { } seconds)
                 _ = ExitLaterAsync(desktop, seconds, _shutdown.Token);
@@ -163,7 +174,7 @@ public sealed class App : Application
         _settingsWindow.Show();
     }
 
-    private bool ApplySettings(IslandSettings settings, bool reconnectSpotify)
+    private bool ApplySettings(IslandSettings settings, bool restartPlayback)
     {
         var previous = _settings;
         if (settings.RememberPosition && _settings.RememberPosition)
@@ -181,24 +192,25 @@ public sealed class App : Application
 
         _settings = settings;
         _overlay?.ApplySettings(_settings);
-        if (Volatile.Read(ref _spotifyService) is { } spotify)
+        if (Volatile.Read(ref _playbackSource) is { } source)
         {
-            spotify.SetLyricsSource(_settings.LyricsSource);
+            source.SetLyricsSource(_settings.LyricsSource);
             if (previous.LyricsSource != _settings.LyricsSource)
-                spotify.RequestCurrentTrackRefresh();
+                source.RequestCurrentTrackRefresh();
         }
-        if (reconnectSpotify && !Program.Options.Demo)
-            _ = RestartSpotifyAsync();
+        if ((restartPlayback || previous.PlaybackSource != _settings.PlaybackSource)
+            && !Program.Options.Demo)
+            _ = RestartPlaybackAsync();
         return true;
     }
 
     private bool RefreshCurrentTrack() =>
-        Volatile.Read(ref _spotifyService)?.RequestCurrentTrackRefresh() == true;
+        Volatile.Read(ref _playbackSource)?.RequestCurrentTrackRefresh() == true;
 
     private bool UpdateTrackOffset(TrackInfo track, int offsetMs) =>
         ApplySettings(
             offsetMs == 0 ? _settings.RemoveTrackOffset(track.Id) : _settings.WithTrackOffset(track, offsetMs),
-            reconnectSpotify: false);
+            restartPlayback: false);
 
     private void SavePosition(PixelPoint position)
     {
@@ -209,29 +221,37 @@ public sealed class App : Application
             _settings = updated;
     }
 
-    private async Task RestartSpotifyAsync()
+    private async Task RestartPlaybackAsync()
     {
-        await _spotifyRestart.WaitAsync();
+        await _playbackRestart.WaitAsync();
         try
         {
-            _spotifyCancellation?.Cancel();
-            if (_spotifyTask is not null)
+            _playbackCancellation?.Cancel();
+            if (_playbackTask is not null)
             {
                 try
                 {
-                    await _spotifyTask;
+                    await _playbackTask;
                 }
                 catch (OperationCanceledException)
                 {
                 }
             }
-            _spotifyCancellation?.Dispose();
-            _spotifyCancellation = null;
-            _spotifyTask = null;
-            Volatile.Write(ref _spotifyService, null);
+            _playbackCancellation?.Dispose();
+            _playbackCancellation = null;
+            _playbackTask = null;
+            Volatile.Write(ref _playbackSource, null);
 
             if (_shutdown.IsCancellationRequested)
                 return;
+
+            if (_settings.PlaybackSource == PlaybackSourcePreference.Mpris)
+            {
+                _store!.Update(new PlaybackSnapshot(
+                    null, 0, Stopwatch.GetTimestamp(), false, "正在连接 MPRIS…"));
+                StartPlaybackSource(new MprisService(_store, _settings.LyricsSource));
+                return;
+            }
 
             var configured = _settings.HasSpotifyCredentials;
             _store!.Update(new PlaybackSnapshot(
@@ -243,19 +263,24 @@ public sealed class App : Application
             if (!configured)
                 return;
 
-            _spotifyCancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
-            var cancellationToken = _spotifyCancellation.Token;
-            var clientId = _settings.SpotifyClientId;
-            var clientSecret = _settings.SpotifyClientSecret;
-            var spotify = new SpotifyService(
-                _store, clientId, clientSecret, _settings.LyricsSource);
-            Volatile.Write(ref _spotifyService, spotify);
-            _spotifyTask = Task.Run(() => spotify.RunAsync(cancellationToken));
+            StartPlaybackSource(new SpotifyService(
+                _store,
+                _settings.SpotifyClientId,
+                _settings.SpotifyClientSecret,
+                _settings.LyricsSource));
         }
         finally
         {
-            _spotifyRestart.Release();
+            _playbackRestart.Release();
         }
+    }
+
+    private void StartPlaybackSource(IPlaybackSource source)
+    {
+        _playbackCancellation = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
+        var cancellationToken = _playbackCancellation.Token;
+        Volatile.Write(ref _playbackSource, source);
+        _playbackTask = Task.Run(() => source.RunAsync(cancellationToken));
     }
 
     private static async Task ExitLaterAsync(
@@ -373,6 +398,30 @@ internal static class SelfCheck
         Require(IslandControl.FindLine(track.Lyrics, 0) == 0, "first line lookup");
         Require(IslandControl.FindLine(track.Lyrics, 7_000) == 1, "line transition lookup");
         Require(IslandControl.FindLine(track.Lyrics, -1) == -1, "pre-roll lookup");
+        const string spotifyId = "4uLU6hMCjMI75M1A2tKUQC";
+        using (var small = SKSurface.Create(new SKImageInfo(16, 16)))
+        using (var smallImage = small.Snapshot())
+        using (var smallPng = smallImage.Encode(SKEncodedImageFormat.Png, 100))
+        {
+            var bytes = smallPng.ToArray().ToImmutableArray();
+            Require(TrackCache.PreferLargerImage(track.AlbumArtBytes, bytes) == track.AlbumArtBytes
+                    && TrackCache.PreferLargerImage(bytes, track.AlbumArtBytes) == track.AlbumArtBytes
+                    && TrackCache.PreferLargerImage(track.AlbumArtBytes, [1, 2, 3]) == track.AlbumArtBytes,
+                "album cache keeps the larger valid image");
+        }
+        Require(SongBanner.MeasureHeight(true, 1400, false)
+                    < SongBanner.MeasureHeight(true, 1400, true)
+                && SongBanner.MeasureHeight(true, 1500, false)
+                    > SongBanner.MeasureHeight(true, 1400, false),
+            "portrait banner fits text and optional brand footer");
+        Require(SongBanner.SpotifyUrl(spotifyId, PlaybackSourcePreference.Spotify)
+                    == $"https://open.spotify.com/track/{spotifyId}"
+                && SongBanner.SpotifyUrl($"spotify:track:{spotifyId}", PlaybackSourcePreference.Spotify)
+                    == $"https://open.spotify.com/track/{spotifyId}"
+                && SongBanner.SpotifyUrl(spotifyId, PlaybackSourcePreference.Mpris) is null
+                && SongBanner.SpotifyUrl("spotify:local:artist:album:song", PlaybackSourcePreference.Spotify) is null
+                && SongBanner.SpotifyUrl("../../../../etc/passwd!", PlaybackSourcePreference.Spotify) is null,
+            "banner QR only links valid Spotify tracks from the Spotify source");
         Require(track.Lyrics.All(line => line.Syllables.IsDefaultOrEmpty
             || string.Concat(line.Syllables.Select(syllable => syllable.Text)) == line.Text),
             "syllable text invariant");
@@ -402,7 +451,9 @@ internal static class SelfCheck
             "paused display modes");
         Require(PlaybackStore.RequiresAttention(PlaybackStore.MissingSpotifyCredentialsStatus)
                 && PlaybackStore.RequiresAttention("Spotify 连接失败：timeout")
+                && PlaybackStore.RequiresAttention("MPRIS 连接失败：session bus unavailable")
                 && !PlaybackStore.RequiresAttention(PlaybackStore.NoActiveSpotifyPlaybackStatus)
+                && !PlaybackStore.RequiresAttention(PlaybackStore.NoActiveMprisPlaybackStatus)
                 && !PlaybackStore.RequiresAttention("演示模式"),
             "playback status visibility");
         var fullCapsule = new Rect(100d, 20d, 400d, 90d);
@@ -444,6 +495,9 @@ internal static class SelfCheck
         Require(IslandControl.ApplyLyricsOffset(previousPlayback, 500d, 250) == 10_750d
                 && IslandControl.ApplyLyricsOffset(previousPlayback with { ReportedPositionMs = 100 }, 0d, -500) == 0d,
             "lyrics offset");
+        Require(IslandControl.ApplyLyricsOffset(
+                previousPlayback with { Track = track with { DurationMs = 0 } }, 500d, 0) == 10_500d,
+            "unknown track duration");
         Require(SpotifyService.StabilizePosition(
                 previousPlayback, track.Id, 8_000, reportedAt, true, true) == 11_000,
             "stale playback position");
@@ -488,6 +542,12 @@ internal static class SelfCheck
             "Spotify credential settings");
         Require(!(configured with { SpotifyClientSecret = string.Empty }).HasSpotifyCredentials,
             "incomplete Spotify credential settings");
+        Require(new IslandSettings().PlaybackSource == PlaybackSourcePreference.Spotify
+                && SettingsStore.Normalize(configured with
+                {
+                    PlaybackSource = (PlaybackSourcePreference)999
+                }).PlaybackSource == PlaybackSourcePreference.Spotify,
+            "playback source setting");
         var trackOffsets = (configured with { EnableTrackOffsets = true }).WithTrackOffset(track, 350);
         var zeroedTrackOffsets = trackOffsets.WithTrackOffset(track, 0);
         var removedTrackOffsets = zeroedTrackOffsets.RemoveTrackOffset(track.Id);
@@ -515,6 +575,8 @@ internal static class SelfCheck
         Require(!refreshService.RequestCurrentTrackRefresh(), "refresh without current track");
         refreshStore.Update(previousPlayback);
         Require(refreshService.RequestCurrentTrackRefresh(), "refresh current track request");
+        CheckMpris();
+        CheckFileArtwork();
         CheckSettingsStore();
         CheckTrackCache(track);
         Require(OverlayWindow.CalculateLogicalHeight(150d) == 174d, "island height scaling");
@@ -568,7 +630,8 @@ internal static class SelfCheck
                 456) with
             {
                 LyricsSource = LyricsSourcePreference.Kugou,
-                EnableTrackOffsets = true
+                EnableTrackOffsets = true,
+                PlaybackSource = PlaybackSourcePreference.Mpris
             };
             expected = expected.WithTrackOffset("track-a", "测试歌曲 — 测试歌手", -275);
             expected = expected.WithTrackOffset("track-zero", "零偏移歌曲", 0);
@@ -607,6 +670,81 @@ internal static class SelfCheck
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", previousConfigHome);
             if (Directory.Exists(configHome))
                 Directory.Delete(configHome, recursive: true);
+        }
+    }
+
+    private static void CheckMpris()
+    {
+        var metadata = new Dict<string, VariantValue>
+        {
+            ["xesam:title"] = "narrative (feat. LiSA)",
+            ["xesam:artist"] = VariantValue.Array(new[] { "SawanoHiroyuki[nZk]" }),
+            ["xesam:album"] = "narrative / NOISEofRAIN - EP",
+            ["mpris:length"] = 260_000_000L,
+            ["mpris:artUrl"] = "file:///tmp/cover.png"
+        };
+        var properties = new Dictionary<string, VariantValue>
+        {
+            ["Metadata"] = metadata,
+            ["PlaybackStatus"] = "Playing",
+            ["Position"] = 122_000_000L,
+            ["Rate"] = 1.25d
+        };
+        var playing = MprisService.ParsePlayer("org.mpris.MediaPlayer2.amberol", properties);
+        Require(playing is not null
+                && playing.Track.Title == "narrative (feat. LiSA)"
+                && playing.Track.Artists.SequenceEqual(["SawanoHiroyuki[nZk]"])
+                && playing.Track.DurationMs == 260_000
+                && playing.PositionMs == 122_000
+                && playing.PlaybackRate == 1.25d,
+            "MPRIS metadata");
+
+        var paused = playing! with
+        {
+            Service = "org.mpris.MediaPlayer2.firefox",
+            PlaybackStatus = "Paused"
+        };
+        Require(MprisService.SelectPlayer([paused, playing], paused.Service) == playing
+                && MprisService.SelectPlayer([playing, playing with
+                {
+                    Service = "org.mpris.MediaPlayer2.other"
+                }], playing.Service) == playing,
+            "MPRIS player selection");
+        Require(MprisService.BuildTrackId("first", "file:///music/song.flac", null, "Song", [], "", 1)
+                == MprisService.BuildTrackId("second", "file:///music/song.flac", null, "Other", [], "", 2),
+            "MPRIS stable URL identity");
+        var reportedAt = Stopwatch.GetTimestamp();
+        var anchorTrack = new TrackInfo(
+            playing.Track.Id,
+            playing.Track.Title,
+            playing.Track.Artists,
+            playing.Track.Album,
+            playing.Track.DurationMs,
+            [],
+            []);
+        var previous = new PlaybackSnapshot(
+            anchorTrack, 122_000, reportedAt - Stopwatch.Frequency, true, "test");
+        var smoothPlayer = playing with { PlaybackRate = 1d };
+        Require(MprisService.StabilizePosition(previous, smoothPlayer, reportedAt, true) == 123_000
+                && MprisService.StabilizePosition(
+                    previous, smoothPlayer with { PositionMs = 110_000 }, reportedAt, true) == 110_000
+                && MprisService.StabilizePosition(previous, smoothPlayer, reportedAt, false) == 122_000,
+            "MPRIS continuous position");
+    }
+
+    private static void CheckFileArtwork()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"lyricify-island-art-{Guid.NewGuid():N}");
+        try
+        {
+            File.WriteAllBytes(path, [1, 2, 3]);
+            var bytes = SpotifyService.LoadImageSafeAsync(new Uri(path).AbsoluteUri, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            Require(bytes.SequenceEqual(new byte[] { 1, 2, 3 }), "MPRIS file artwork");
+        }
+        finally
+        {
+            File.Delete(path);
         }
     }
 

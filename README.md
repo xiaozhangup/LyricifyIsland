@@ -4,7 +4,7 @@
 
 https://github.com/user-attachments/assets/bc65054e-03d4-4007-9032-1123cf56aa45
 
-Linux 桌面顶置歌词岛。当前曲目和播放进度来自 Spotify Web API；逐字歌词与翻译通过
+Linux 桌面顶置歌词岛。当前曲目和播放进度可来自 Spotify Web API 或本机 MPRIS；逐字歌词与翻译通过
 [Lyricify Lyrics Helper](https://github.com/WXRIW/Lyricify-Lyrics-Helper) 获取和解析。
 字体、逐字裁剪、双层微光、播放头 bloom 与换行动画都在 Skia 自绘层完成，正常桌面运行时由 GPU 渲染。
 
@@ -21,7 +21,9 @@ Linux 桌面顶置歌词岛。当前曲目和播放进度来自 Spotify Web API�
 3. 岛屿提示未配置时，打开托盘菜单的“设置”，填写 Spotify Client ID 和
    Client Secret，然后点击“保存并重新连接”。
 
-首次启动会打开浏览器，请登录并允许读取当前播放状态。刷新令牌只保存在当前用户的状态目录，
+也可以在设置中把“播放信息源”切换为“本地 MPRIS”，直接读取本机播放器，无需 Spotify 参数或授权。
+
+Spotify 模式首次授权时会打开浏览器，请登录并允许读取当前播放状态。刷新令牌只保存在当前用户的状态目录，
 凭据只保存在当前用户的设置文件中；凭据、令牌、构建缓存和发布目录都不会进入 Git。
 发布物 `dist/LyricifyIsland` 是单个可执行文件，自带 .NET 运行时和原生库，启动不要求系统安装 .NET。
 
@@ -29,6 +31,18 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 程序启动后常驻系统托盘；托盘菜单提供“设置”和“退出”。
 黑色岛屿区域支持按住左键拖动、左键双击临时隐藏，区域外保持鼠标穿透；
 右键菜单也可临时隐藏、调整当前歌曲偏移、水平居中或退出。隐藏时长和拖动行为都可在设置中调整。
+右键选择“复制歌曲分享图…”打开预览，选好横竖版和要显示的内容，再点击“复制图片”即可粘贴。
+横版宽 2560 像素，竖版宽 2160 像素，高度随内容调整；预览旁会显示复制图片的实际尺寸。
+图片保留圆角、阴影和透明留边。粘贴后的透明效果取决于接收应用。
+
+歌词默认选中打开右键菜单时正在播放的那一句，也可以另选或关闭；歌词翻译沿用软件设置。
+软件名默认不显示。Spotify 在线歌曲可选择显示二维码，扫码即可打开歌曲；
+二维码位于歌曲信息右侧，MPRIS 音源和 Spotify 本地文件不提供二维码。
+关闭二维码后，歌曲信息会占满可用宽度；关闭歌词或软件名后，图片会收起多余的空白。
+
+预览窗口始终展示打开时的歌曲，不随播放器切歌。
+窗口打开后会重新加载封面，复制时会等待加载完成，并优先使用分辨率较高的版本。
+加载失败时会提示使用缓存封面。
 
 ## 本地验收
 
@@ -38,6 +52,8 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 ./run.sh --demo
 ./dist/LyricifyIsland --self-test
 ./dist/LyricifyIsland --snapshot /tmp/lyricify-island.png
+./dist/LyricifyIsland --snapshot /tmp/banner-wide.png --banner
+./dist/LyricifyIsland --snapshot /tmp/banner-tall.png --banner --portrait
 ```
 
 `--demo --exit-after 5` 可用于五秒启动冒烟检查。
@@ -56,6 +72,7 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 - 暂停行为：立即隐藏、3 秒后隐藏或保持显示；连接和错误提示不会被隐藏。
 - 临时隐藏：可选 2、5、10 或 30 秒。
 - 登录后自动启动：写入当前用户的 XDG 自启动目录。
+- 播放信息源：可在 Spotify Web API 与本地 MPRIS 之间切换。
 - Spotify Client ID 和 Client Secret：点击保存后重新连接，Secret 在界面中遮蔽显示。
 - 缓存：显示歌词、封面和歌曲信息缓存占用，并可一键清理。
 
