@@ -8,6 +8,8 @@ Linux 桌面顶置歌词岛。当前曲目和播放进度可来自 Spotify Web A
 [Lyricify Lyrics Helper](https://github.com/WXRIW/Lyricify-Lyrics-Helper) 获取和解析。
 字体、逐字裁剪、双层微光、播放头 bloom 与换行动画都在 Skia 自绘层完成，正常桌面运行时由 GPU 渲染。
 
+![Lyricify Island 歌词窗口：封面、播放控件、滚动歌词与翻译](docs/images/lyrics-window.png)
+
 ## 首次运行
 
 1. 在 [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) 的应用设置中加入回调地址：
