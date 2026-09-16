@@ -53,6 +53,7 @@ public sealed class OverlayWindow : Window
         Action<PixelPoint> positionChanged,
         Func<TrackInfo, int, bool> trackOffsetChanged,
         Action showSettings,
+        Action showLyricsWindow,
         Action exit)
     {
         _store = store;
@@ -108,12 +109,16 @@ public sealed class OverlayWindow : Window
         center.Click += (_, _) => CenterHorizontally();
         var settingsItem = CreateContextMenuItem("设置…");
         settingsItem.Click += (_, _) => showSettings();
+        var lyricsWindowItem = CreateContextMenuItem("打开歌词窗口");
+        lyricsWindowItem.Click += (_, _) => showLyricsWindow();
         var exitItem = CreateContextMenuItem("退出");
         exitItem.Click += (_, _) => exit();
         var contextMenu = new ContextMenu
         {
             ItemsSource = new Control[]
             {
+                lyricsWindowItem,
+                CreateMenuSeparator(),
                 _hideItem,
                 center,
                 _bannerItem,
@@ -425,6 +430,7 @@ public sealed class IslandControl : Control, IDisposable
     private int _lyricsOffsetMs;
     private ImmutableDictionary<string, int>? _trackOffsetsMs;
     private bool _showTranslation = true;
+    private bool _showIsland = true;
     private PausedDisplayMode _pausedDisplay;
     private bool _inactive;
     private long _inactiveAt;
@@ -458,7 +464,7 @@ public sealed class IslandControl : Control, IDisposable
             return;
 
         var snapshot = _store.Snapshot;
-        if (snapshot.IsPlaying || _outgoing is not null || _capsuleTransitioning || _delayedHidePending
+        if ((_showIsland && snapshot.IsPlaying) || _outgoing is not null || _capsuleTransitioning || _delayedHidePending
             || !ReferenceEquals(snapshot, _renderedSnapshot))
             InvalidateVisual();
         QueueAnimationFrame();
@@ -470,6 +476,12 @@ public sealed class IslandControl : Control, IDisposable
         _lyricsOffsetMs = settings.LyricsOffsetMs;
         _trackOffsetsMs = settings.EnableTrackOffsets ? settings.TrackOffsetsMs : null;
         _showTranslation = settings.ShowTranslation;
+        _showIsland = settings.ShowIsland;
+        if (_renderedSnapshot is null)
+        {
+            _capsuleShown = _showIsland;
+            _capsuleProgress = _capsuleFrom = _showIsland ? 1 : 0;
+        }
         _pausedDisplay = settings.PausedDisplay;
         _renderer.SetBackgroundOpacity(settings.BackgroundOpacityPercent);
         InvalidateVisual();
@@ -527,8 +539,8 @@ public sealed class IslandControl : Control, IDisposable
         var inactiveSeconds = inactive && _inactiveAt != 0
             ? Stopwatch.GetElapsedTime(_inactiveAt, now).TotalSeconds
             : 0d;
-        var capsuleShown = ShouldShowCapsule(inactive, _pausedDisplay, inactiveSeconds);
-        _delayedHidePending = inactive
+        var capsuleShown = _showIsland && ShouldShowCapsule(inactive, _pausedDisplay, inactiveSeconds);
+        _delayedHidePending = _showIsland && inactive
             && _pausedDisplay == PausedDisplayMode.HideAfterThreeSeconds
             && inactiveSeconds < 3d;
         if (capsuleShown != _capsuleShown)
@@ -1559,7 +1571,7 @@ internal sealed class NativeOverlay : IDisposable
         }
     }
 
-    public void SetInputRegion(Rect logicalBounds, double scaling, bool transparent = false)
+    public void SetInputRegion(Rect logicalBounds, double scaling, bool transparent = false, double? cornerRadius = null)
     {
         if (_display == IntPtr.Zero || !_shapeAvailable)
             return;
@@ -1578,7 +1590,8 @@ internal sealed class NativeOverlay : IDisposable
             }
             else
             {
-                var rows = CapsuleRows(bounds);
+                var rows = cornerRadius is { } radius
+                    ? RoundedRows(bounds, radius * scaling) : CapsuleRows(bounds);
                 var rectangles = new XRectangle[rows.Length];
                 for (var i = 0; i < rows.Length; i++)
                 {
@@ -1646,6 +1659,19 @@ internal sealed class NativeOverlay : IDisposable
                 bounds.Y + row,
                 Math.Max(1, bounds.Width - inset * 2),
                 1);
+        }
+        return rows;
+    }
+
+    private static PixelRect[] RoundedRows(PixelRect bounds, double radius)
+    {
+        radius = Math.Clamp(radius, 0, Math.Min(bounds.Width, bounds.Height) / 2d);
+        var rows = new PixelRect[bounds.Height];
+        for (var row = 0; row < rows.Length; row++)
+        {
+            var dy = Math.Max(0, radius - Math.Min(row + .5, bounds.Height - row - .5));
+            var inset = (int)Math.Ceiling(radius - Math.Sqrt(Math.Max(0, radius * radius - dy * dy)));
+            rows[row] = new PixelRect(bounds.X + inset, bounds.Y + row, Math.Max(1, bounds.Width - inset * 2), 1);
         }
         return rows;
     }

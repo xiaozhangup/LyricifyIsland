@@ -18,6 +18,8 @@ internal sealed class MprisService : IPlaybackSource
 
     private readonly PlaybackStore _store;
     private readonly SemaphoreSlim _pollWake = new(0);
+    private readonly SemaphoreSlim _playerGate = new(1, 1);
+    private bool _forcePositionSync;
     private TrackInfo? _track;
     private TrackInfo? _loadingTrack;
     private CancellationTokenSource? _trackLoad;
@@ -51,7 +53,9 @@ internal sealed class MprisService : IPlaybackSource
             var delay = PollInterval;
             try
             {
-                await PollAsync(cancellationToken);
+                await _playerGate.WaitAsync(cancellationToken);
+                try { await PollAsync(cancellationToken); }
+                finally { _playerGate.Release(); }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -103,9 +107,10 @@ internal sealed class MprisService : IPlaybackSource
         player = player with { PositionMs = ApplyCrossfadeOffset(player, reportedAt) };
         player = player with
         {
-            PositionMs = StabilizePosition(
+            PositionMs = _forcePositionSync ? player.PositionMs : StabilizePosition(
                 previous, player, reportedAt, _selectedService == player.Service)
         };
+        _forcePositionSync = false;
         _selectedService = player.Service;
         var forceRefresh = Interlocked.Exchange(ref _refreshCurrentTrack, 0) != 0;
         var currentTrack = Volatile.Read(ref _track);
@@ -146,7 +151,93 @@ internal sealed class MprisService : IPlaybackSource
                 : $"未找到歌词 · {string.Join(", ", track.Artists)}"
             : string.Join(", ", track.Artists);
         return new PlaybackSnapshot(
-            track, player.PositionMs, reportedAt, player.IsPlaying, status, player.PlaybackRate);
+            track, player.PositionMs, reportedAt, player.IsPlaying, status, player.PlaybackRate)
+        { Controls = player.Controls };
+    }
+
+    public async Task<string?> ControlAsync(PlaybackCommand command, CancellationToken cancellationToken)
+    {
+        await _playerGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_selectedService is not { } service)
+                return "没有可控制的 MPRIS 播放器";
+            var properties = await GetPlayerPropertiesAsync(service).WaitAsync(PlayerTimeout, cancellationToken);
+            var player = ParsePlayer(service, properties);
+            if (player is null || command.TrackId is { } id && id != player.Track.Id)
+                return "歌曲已切换，请重试";
+            var controls = player.Controls;
+            var allowed = command.Action switch
+            {
+                PlaybackAction.PlayPause => controls.CanPlayPause,
+                PlaybackAction.Previous => controls.CanPrevious,
+                PlaybackAction.Next => controls.CanNext,
+                PlaybackAction.Seek => controls.CanSeek,
+                PlaybackAction.Shuffle => controls.Shuffle.HasValue,
+                PlaybackAction.Repeat => controls.Repeat is not null,
+                PlaybackAction.Volume => controls.Volume.HasValue,
+                _ => false
+            };
+            if (!allowed)
+                return "当前播放器不支持此操作";
+            await SendControlAsync(service, player, command).WaitAsync(PlayerTimeout, cancellationToken);
+            if (command.Action is PlaybackAction.Seek or PlaybackAction.PlayPause)
+            {
+                _crossfadeOffsetMs = 0;
+                _forcePositionSync = true;
+            }
+            await PollAsync(cancellationToken);
+            return null;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception exception) { return $"播放控制失败：{Friendly(exception)}"; }
+        finally { _playerGate.Release(); }
+    }
+
+    private static Task SendControlAsync(string service, Player player, PlaybackCommand command)
+    {
+        var connection = DBusConnection.Session;
+        using var writer = connection.GetMessageWriter();
+        var property = command.Action switch
+        {
+            PlaybackAction.Shuffle => "Shuffle",
+            PlaybackAction.Repeat => "LoopStatus",
+            PlaybackAction.Volume => "Volume",
+            _ => null
+        };
+        if (property is not null)
+        {
+            writer.WriteMethodCallHeader(destination: service, path: PlayerPath,
+                @interface: PropertiesInterface, member: "Set", signature: "ssv");
+            writer.WriteString(PlayerInterface);
+            writer.WriteString(property);
+            if (command.Action == PlaybackAction.Shuffle)
+                writer.WriteVariantBool(command.Value > 0);
+            else if (command.Action == PlaybackAction.Volume)
+                writer.WriteVariantDouble(Math.Clamp(command.Value, 0, 1));
+            else
+                writer.WriteVariantString(command.Value switch { 1 => "Playlist", 2 => "Track", _ => "None" });
+        }
+        else
+        {
+            var method = command.Action switch
+            {
+                PlaybackAction.PlayPause => "PlayPause",
+                PlaybackAction.Previous => "Previous",
+                PlaybackAction.Next => "Next",
+                _ => "SetPosition"
+            };
+            writer.WriteMethodCallHeader(destination: service, path: PlayerPath,
+                @interface: PlayerInterface, member: method,
+                signature: command.Action == PlaybackAction.Seek ? "ox" : null);
+            if (command.Action == PlaybackAction.Seek)
+            {
+                writer.WriteObjectPath(player.TrackPath!);
+                writer.WriteInt64((long)Math.Clamp(command.Value, 0,
+                    Math.Max(0, player.Track.DurationMs - 1)) * 1_000);
+            }
+        }
+        return connection.CallMethodAsync(writer.CreateMessage());
     }
 
     private async Task CompleteTrackAsync(
@@ -334,7 +425,22 @@ internal sealed class MprisService : IPlaybackSource
             durationMs,
             null,
             String(metadata, "mpris:artUrl"));
-        return new Player(service, track, positionMs, playbackStatus, playbackRate);
+        var canControl = Boolean(properties, "CanControl") == true;
+        return new Player(service, track, positionMs, playbackStatus, playbackRate)
+        {
+            TrackPath = trackPath,
+            Controls = new PlaybackControls(
+                canControl && Boolean(properties, playbackStatus == "Playing" ? "CanPause" : "CanPlay") == true,
+                canControl && Boolean(properties, "CanGoPrevious") == true,
+                canControl && Boolean(properties, "CanGoNext") == true,
+                canControl && Boolean(properties, "CanSeek") == true && durationMs > 0
+                    && trackPath is not null && trackPath != "/org/mpris/MediaPlayer2/TrackList/NoTrack",
+                canControl ? Boolean(properties, "Shuffle") : null,
+                canControl ? String(properties, "LoopStatus") switch
+                    { "None" => "off", "Playlist" => "context", "Track" => "track", _ => null } : null,
+                canControl && properties.ContainsKey("Volume")
+                    ? Math.Clamp(Double(properties, "Volume"), 0, 1) : null)
+        };
     }
 
     internal static Player? SelectPlayer(IReadOnlyList<Player> players, string? selectedService) =>
@@ -361,6 +467,10 @@ internal sealed class MprisService : IPlaybackSource
 
     private static VariantValue Unwrap(VariantValue value) =>
         value.Type == VariantValueType.Variant ? value.GetVariantValue() : value;
+
+    private static bool? Boolean(IReadOnlyDictionary<string, VariantValue> values, string key) =>
+        values.TryGetValue(key, out var value) && Unwrap(value).Type == VariantValueType.Bool
+            ? Unwrap(value).GetBool() : null;
 
     private static string? String(IReadOnlyDictionary<string, VariantValue> values, string key)
     {
@@ -449,5 +559,7 @@ internal sealed class MprisService : IPlaybackSource
         double PlaybackRate = 1d)
     {
         public bool IsPlaying => PlaybackStatus == "Playing";
+        public string? TrackPath { get; init; }
+        public PlaybackControls Controls { get; init; } = new();
     }
 }

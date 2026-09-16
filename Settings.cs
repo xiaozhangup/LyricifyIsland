@@ -52,7 +52,8 @@ internal readonly record struct IslandSettings(
     bool EnableTrackOffsets = false,
     ImmutableDictionary<string, int>? TrackOffsetsMs = null,
     ImmutableDictionary<string, string>? TrackOffsetTitles = null,
-    PlaybackSourcePreference PlaybackSource = PlaybackSourcePreference.Spotify)
+    PlaybackSourcePreference PlaybackSource = PlaybackSourcePreference.Spotify,
+    bool ShowIsland = true)
 {
     public bool HasSpotifyCredentials =>
         !string.IsNullOrWhiteSpace(SpotifyClientId)
@@ -154,7 +155,8 @@ internal static class SettingsStore
                 data?.EnableTrackOffsets ?? data?.TrackOffsetsMs is { Count: > 0 },
                 data?.TrackOffsetsMs?.ToImmutableDictionary(StringComparer.Ordinal),
                 data?.TrackOffsetTitles?.ToImmutableDictionary(StringComparer.Ordinal),
-                data?.PlaybackSource ?? PlaybackSourcePreference.Spotify));
+                data?.PlaybackSource ?? PlaybackSourcePreference.Spotify,
+                data?.ShowIsland ?? true));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -200,7 +202,8 @@ internal static class SettingsStore
                     EnableTrackOffsets = settings.EnableTrackOffsets,
                     TrackOffsetsMs = settings.TrackOffsetsMs?.ToDictionary(),
                     TrackOffsetTitles = settings.TrackOffsetTitles?.ToDictionary(),
-                    PlaybackSource = settings.PlaybackSource
+                    PlaybackSource = settings.PlaybackSource,
+                    ShowIsland = settings.ShowIsland
                 }));
             Secure(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             File.Move(temporary, path, overwrite: true);
@@ -346,6 +349,7 @@ internal static class SettingsStore
         public Dictionary<string, int>? TrackOffsetsMs { get; init; }
         public Dictionary<string, string>? TrackOffsetTitles { get; init; }
         public PlaybackSourcePreference? PlaybackSource { get; init; }
+        public bool? ShowIsland { get; init; }
     }
 }
 
@@ -440,9 +444,10 @@ internal sealed class SettingsWindow : Window
             bool restartPlayback = false,
             bool trackOffsetsChanged = false)
         {
+            var latest = currentSettings();
+            updated = updated with { ShowIsland = latest.ShowIsland };
             if (!trackOffsetsChanged)
             {
-                var latest = currentSettings();
                 updated = updated with
                 {
                     TrackOffsetsMs = latest.TrackOffsetsMs,

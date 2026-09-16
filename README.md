@@ -28,7 +28,7 @@ Spotify 模式首次授权时会打开浏览器，请登录并允许读取当前
 发布物 `dist/LyricifyIsland` 是单个可执行文件，自带 .NET 运行时和原生库，启动不要求系统安装 .NET。
 
 Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账号加入应用用户列表。
-程序启动后常驻系统托盘；托盘菜单提供“设置”和“退出”。
+程序启动后常驻系统托盘；托盘菜单提供“打开歌词窗口”“设置”和“退出”。
 黑色岛屿区域支持按住左键拖动、左键双击临时隐藏，区域外保持鼠标穿透；
 右键菜单也可临时隐藏、调整当前歌曲偏移、水平居中或退出。隐藏时长和拖动行为都可在设置中调整。
 右键选择“复制歌曲分享图…”打开预览，选好横竖版和要显示的内容，再点击“复制图片”即可粘贴。
@@ -44,14 +44,46 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 窗口打开后会重新加载封面，复制时会等待加载完成，并优先使用分辨率较高的版本。
 加载失败时会提示使用缓存封面。
 
+## 歌词窗口
+
+点击托盘图标，或在托盘 / 歌词岛右键菜单选择“打开歌词窗口”。也可以用
+`./run.sh --lyrics-window` 启动时直接打开。
+
+界面参考 [Lyricify 的 Apple Music Sing 演示](https://www.bilibili.com/video/BV1bK41167Q4/)。
+窗口关闭系统标题栏和边框，圆角、阴影、标题栏按钮、封面、播放控件和歌词都由 Skia 绘制。
+全屏时去掉窗口圆角、阴影和外侧留边，背景铺满屏幕；退出全屏后恢复圆角窗口。
+左侧封面、歌曲信息和播放控件随窗口宽高调整大小，右侧显示滚动歌词；缩小窗口后自动切换为上下布局。
+背景从封面取色，切歌时平滑交叉淡化；按钮悬浮、按下、开关和禁用恢复状态也带淡入淡出。
+进入和退出纯歌词模式时，封面淡入淡出，歌词区域和播放控件平滑移动，换行变化通过淡化衔接。
+歌词逐行弹性滚动，远处的歌词模糊淡出。逐字歌词按真实时间戳渐亮，
+长音轻微上浮；只有逐行时间戳的歌词整行点亮。
+阴影和可见的静止歌词按屏幕缩放缓存，减少重复模糊与离屏合成；缓存随内容、尺寸或缩放更新，
+滚动、逐字高亮和交互动画仍实时绘制，保留原有刷新率和效果。
+
+- 拖动标题栏或封面移动窗口，拖动边缘缩放，双击标题栏切换最大化。
+- 滚轮或拖动歌词浏览，停止操作 5 秒后恢复跟随，也可点击“回到当前歌词”。
+- 点击歌词跳到对应时间；进度条和音量条支持拖动。
+- 播放 / 暂停、上一首、下一首、随机和循环控制当前音源，不支持的操作会变灰。
+- 顶栏可切换翻译、纯歌词、灵动岛显示、置顶和全屏，并打开原有设置。
+  灵动岛开关会保存，重启后继续生效；翻译与歌词偏移和歌词岛共用。
+- 空格播放 / 暂停，左右方向键快退 / 快进 5 秒，上下方向键浏览歌词，Home 恢复跟随，
+  T 切换翻译，Ctrl+L 切换纯歌词，F11 切换全屏。Esc 依次退出全屏、恢复跟随或关闭歌词窗口。
+
+关闭歌词窗口后程序仍在托盘运行。MPRIS 直接控制当前选中的本地播放器。
+Spotify 播放控制使用官方 API，需要 Premium 与 `user-modify-playback-state` 权限；
+旧版本的只读授权在首次点击播放控件时会打开浏览器申请新增权限，单纯显示歌词不触发重新授权。
+相关限制见 [Spotify 播放控制文档](https://developer.spotify.com/documentation/web-api/reference/start-a-users-playback)。
+
 ## 本地验收
 
 无需 Spotify 即可查看内置的参考动效：
 
 ```bash
 ./run.sh --demo
+./run.sh --demo --lyrics-window
 ./dist/LyricifyIsland --self-test
 ./dist/LyricifyIsland --snapshot /tmp/lyricify-island.png
+./dist/LyricifyIsland --snapshot /tmp/lyricify-lyrics-window.png --lyrics-window
 ./dist/LyricifyIsland --snapshot /tmp/banner-wide.png --banner
 ./dist/LyricifyIsland --snapshot /tmp/banner-tall.png --banner --portrait
 ```

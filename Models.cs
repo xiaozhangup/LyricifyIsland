@@ -30,7 +30,16 @@ public sealed record PlaybackSnapshot(
     long ReportedAtTimestamp,
     bool IsPlaying,
     string Status,
-    double PlaybackRate = 1d);
+    double PlaybackRate = 1d)
+{
+    public PlaybackControls Controls { get; init; } = new();
+
+    public double PositionMs => Math.Clamp(
+        ReportedPositionMs + (IsPlaying
+            ? System.Diagnostics.Stopwatch.GetElapsedTime(ReportedAtTimestamp).TotalMilliseconds * PlaybackRate
+            : 0),
+        0, Track is { DurationMs: > 0 } track ? track.DurationMs : double.MaxValue);
+}
 
 internal sealed record SourceTrack(
     string Id,
@@ -48,7 +57,21 @@ internal interface IPlaybackSource
     Task RunAsync(CancellationToken cancellationToken);
     void SetLyricsSource(LyricsSourcePreference source);
     bool RequestCurrentTrackRefresh();
+    Task<string?> ControlAsync(PlaybackCommand command, CancellationToken cancellationToken);
 }
+
+internal enum PlaybackAction { PlayPause, Previous, Next, Seek, Shuffle, Repeat, Volume }
+
+internal sealed record PlaybackCommand(PlaybackAction Action, double Value = 0, string? TrackId = null);
+
+public sealed record PlaybackControls(
+    bool CanPlayPause = false,
+    bool CanPrevious = false,
+    bool CanNext = false,
+    bool CanSeek = false,
+    bool? Shuffle = null,
+    string? Repeat = null,
+    double? Volume = null);
 
 public sealed class PlaybackStore
 {

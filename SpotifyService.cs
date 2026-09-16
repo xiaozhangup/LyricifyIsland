@@ -12,8 +12,9 @@ namespace LyricifyIsland;
 internal sealed class SpotifyService : IPlaybackSource
 {
     private const string RedirectUri = "http://127.0.0.1:43821/callback";
-    private const string Scope = "user-read-currently-playing user-read-playback-state";
-    private const string CurrentlyPlayingUrl = "https://api.spotify.com/v1/me/player/currently-playing?additional_types=track";
+    private const string ControlScope = "user-modify-playback-state";
+    private const string Scope = "user-read-currently-playing user-read-playback-state " + ControlScope;
+    private const string CurrentlyPlayingUrl = "https://api.spotify.com/v1/me/player?additional_types=track";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(750);
     private const long CrossfadeTransitionSlackMs = 1_500;
     private static readonly HttpClient Http = new();
@@ -21,6 +22,7 @@ internal sealed class SpotifyService : IPlaybackSource
     private readonly PlaybackStore _store;
     private readonly Credentials _credentials;
     private readonly SemaphoreSlim _pollWake = new(0);
+    private readonly SemaphoreSlim _playerGate = new(1, 1);
     private TokenState? _tokens;
     private TrackInfo? _track;
     private TrackInfo? _loadingTrack;
@@ -79,9 +81,14 @@ internal sealed class SpotifyService : IPlaybackSource
             var delay = PollInterval;
             try
             {
-                if (_tokens!.ExpiresAt <= DateTimeOffset.UtcNow.AddSeconds(30))
-                    _tokens = await RefreshOrAuthorizeAsync(cancellationToken);
-                delay = await PollAsync(cancellationToken);
+                await _playerGate.WaitAsync(cancellationToken);
+                try
+                {
+                    if (_tokens!.ExpiresAt <= DateTimeOffset.UtcNow.AddSeconds(30))
+                        _tokens = await RefreshOrAuthorizeAsync(cancellationToken);
+                    delay = await PollAsync(cancellationToken);
+                }
+                finally { _playerGate.Release(); }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -233,9 +240,92 @@ internal sealed class SpotifyService : IPlaybackSource
                     ? "正在获取歌词…"
                     : $"未找到歌词 · {string.Join(", ", currentTrack.Artists)}"
                 : string.Join(", ", currentTrack.Artists);
-            _store.Update(new PlaybackSnapshot(currentTrack, position, reportedAt, isPlaying, status));
+            _store.Update(new PlaybackSnapshot(currentTrack, position, reportedAt, isPlaying, status)
+            { Controls = ReadControls(root, isPlaying, currentTrack.DurationMs) });
             return PollInterval;
         }
+    }
+
+    private static PlaybackControls ReadControls(JsonElement root, bool isPlaying, long duration)
+    {
+        var hasDisallows = root.TryGetProperty("actions", out var actions)
+            && actions.TryGetProperty("disallows", out _);
+        bool Allowed(string action) => !hasDisallows || !GetBoolean(actions.GetProperty("disallows"), action);
+        var volume = root.TryGetProperty("device", out var device)
+            && GetBoolean(device, "supports_volume")
+            && GetNullableInt64(device, "volume_percent") is { } percent
+                ? percent / 100d : (double?)null;
+        return new PlaybackControls(
+            Allowed(isPlaying ? "pausing" : "resuming"),
+            Allowed("skipping_prev"), Allowed("skipping_next"), Allowed("seeking") && duration > 0,
+            Allowed("toggling_shuffle") && root.TryGetProperty("shuffle_state", out _)
+                ? GetBoolean(root, "shuffle_state") : null,
+            Allowed("toggling_repeat_context") && Allowed("toggling_repeat_track")
+                ? GetString(root, "repeat_state") : null,
+            volume);
+    }
+
+    public async Task<string?> ControlAsync(PlaybackCommand command, CancellationToken cancellationToken)
+    {
+        await _playerGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_tokens is null)
+                return "请先连接 Spotify";
+            // Existing read-only logins keep working; request the extra scope only on a control action.
+            if (_tokens.GrantedScope?.Split(' ').Contains(ControlScope) != true)
+            {
+                _tokens = await AuthorizeAsync(cancellationToken);
+                await PollAsync(cancellationToken);
+            }
+            if (_tokens.ExpiresAt <= DateTimeOffset.UtcNow.AddSeconds(30))
+                _tokens = await RefreshOrAuthorizeAsync(cancellationToken);
+            var snapshot = _store.Snapshot;
+            if (snapshot.Track is null || command.TrackId is { } id && id != snapshot.Track.Id)
+                return "歌曲已切换，请重试";
+            var endpoint = command.Action switch
+            {
+                PlaybackAction.PlayPause => snapshot.IsPlaying ? "pause" : "play",
+                PlaybackAction.Previous => "previous",
+                PlaybackAction.Next => "next",
+                PlaybackAction.Seek => $"seek?position_ms={(long)Math.Clamp(command.Value, 0, Math.Max(0, snapshot.Track.DurationMs - 1))}",
+                PlaybackAction.Shuffle => $"shuffle?state={(command.Value > 0 ? "true" : "false")}",
+                PlaybackAction.Repeat => $"repeat?state={command.Value switch { 1 => "context", 2 => "track", _ => "off" }}",
+                PlaybackAction.Volume => $"volume?volume_percent={(int)Math.Round(Math.Clamp(command.Value, 0, 1) * 100)}",
+                _ => throw new InvalidOperationException("不支持的播放操作")
+            };
+            using var request = new HttpRequestMessage(
+                command.Action is PlaybackAction.Previous or PlaybackAction.Next ? HttpMethod.Post : HttpMethod.Put,
+                "https://api.spotify.com/v1/me/player/" + endpoint);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _tokens.AccessToken);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
+            using var response = await Http.SendAsync(request, timeout.Token);
+            if (!response.IsSuccessStatusCode)
+                return response.StatusCode switch
+                {
+                    HttpStatusCode.Forbidden => "Spotify 拒绝操作：播放控制需要 Premium，或当前设备不支持此操作",
+                    HttpStatusCode.NotFound => "请先在 Spotify 中选择播放设备并播放歌曲",
+                    HttpStatusCode.Unauthorized => "Spotify 授权已过期，请稍后重试",
+                    (HttpStatusCode)429 => "Spotify 请求过于频繁，请稍后重试",
+                    _ => $"Spotify 播放控制失败（{(int)response.StatusCode}）"
+                };
+            if (command.Action == PlaybackAction.Seek)
+            {
+                _crossfadeOffsetMs = 0;
+                _store.Update(snapshot with
+                {
+                    ReportedPositionMs = (long)Math.Clamp(command.Value, 0, snapshot.Track.DurationMs),
+                    ReportedAtTimestamp = Stopwatch.GetTimestamp()
+                });
+            }
+            Interlocked.Increment(ref _positionSyncVersion);
+            _pollWake.Release();
+            return null;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception exception) { return $"播放控制失败：{Friendly(exception)}"; }
+        finally { _playerGate.Release(); }
     }
 
     private async Task CompleteTrackAsync(
@@ -589,7 +679,8 @@ internal sealed class SpotifyService : IPlaybackSource
             accessToken,
             refreshToken,
             DateTimeOffset.UtcNow.AddSeconds(expiresIn),
-            _credentials.ClientId);
+            _credentials.ClientId,
+            GetString(root, "scope") ?? (existingRefreshToken is null ? Scope : _tokens?.GrantedScope));
     }
 
     private async Task<TokenState?> LoadTokenAsync(CancellationToken cancellationToken)
@@ -944,7 +1035,8 @@ internal sealed class SpotifyService : IPlaybackSource
         string AccessToken,
         string RefreshToken,
         DateTimeOffset ExpiresAt,
-        string? ClientId = null);
+        string? ClientId = null,
+        string? GrantedScope = null);
 
     private sealed class TokenEndpointException(HttpStatusCode statusCode, string message)
         : Exception(message)

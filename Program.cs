@@ -15,6 +15,7 @@ namespace LyricifyIsland;
 
 internal sealed record LaunchOptions(bool Demo, string? SnapshotPath, double? ExitAfterSeconds)
 {
+    public bool LyricsWindow { get; init; }
     public static LaunchOptions Parse(string[] args)
     {
         string? ValueAfter(string name)
@@ -24,7 +25,8 @@ internal sealed record LaunchOptions(bool Demo, string? SnapshotPath, double? Ex
         }
 
         var exitAfter = double.TryParse(ValueAfter("--exit-after"), out var seconds) ? (double?)seconds : null;
-        return new LaunchOptions(args.Contains("--demo"), ValueAfter("--snapshot"), exitAfter);
+        return new LaunchOptions(args.Contains("--demo"), ValueAfter("--snapshot"), exitAfter)
+        { LyricsWindow = args.Contains("--lyrics-window") };
     }
 }
 
@@ -38,6 +40,23 @@ internal static class Program
         Options = LaunchOptions.Parse(args);
         if (args.Contains("--self-test"))
             return SelfCheck.Run();
+        if (Options.SnapshotPath is { } lyricsPath && Options.LyricsWindow)
+        {
+            using var surface = SKSurface.Create(new SKImageInfo(1120, 720));
+            using var renderer = new LyricsWindowRenderer();
+            var snapshot = new PlaybackSnapshot(DemoSource.Track, 9_650,
+                Stopwatch.GetTimestamp(), true, "演示模式")
+            { Controls = new PlaybackControls(true, false, false, true) };
+            renderer.Draw(surface.Canvas, 1120, 720,
+                new LyricsWindowFrame(snapshot, 9_650, 9_650, 10, true, false, false, false,
+                    false, null, null, null, new Point(-1, -1), false));
+            using var image = surface.Snapshot();
+            using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(lyricsPath))!);
+            File.WriteAllBytes(lyricsPath, data.ToArray());
+            Console.WriteLine(Path.GetFullPath(lyricsPath));
+            return 0;
+        }
         if (Options.SnapshotPath is { } bannerPath && args.Contains("--banner"))
         {
             BuildAvaloniaApp().SetupWithoutStarting();
@@ -83,6 +102,7 @@ public sealed class App : Application
     private readonly SemaphoreSlim _playbackRestart = new(1, 1);
     private TrayIcon? _trayIcon;
     private SettingsWindow? _settingsWindow;
+    private LyricsWindow? _lyricsWindow;
     private OverlayWindow? _overlay;
     private WindowIcon? _appIcon;
     private PlaybackStore? _store;
@@ -111,7 +131,8 @@ public sealed class App : Application
             if (_settings.StartOnLogin)
                 Autostart.SetEnabled(true);
             _overlay = new OverlayWindow(
-                _store, _settings, SavePosition, UpdateTrackOffset, ShowSettings, () => desktop.Shutdown());
+                _store, _settings, SavePosition, UpdateTrackOffset, ShowSettings, ShowLyricsWindow,
+                () => desktop.Shutdown());
             desktop.MainWindow = _overlay;
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             CreateTrayIcon(desktop);
@@ -120,6 +141,9 @@ public sealed class App : Application
                 _ = DemoSource.RunAsync(_store, _shutdown.Token);
             else
                 _ = RestartPlaybackAsync();
+
+            if (Program.Options.LyricsWindow)
+                Dispatcher.UIThread.Post(ShowLyricsWindow);
 
             if (Program.Options.ExitAfterSeconds is { } seconds)
                 _ = ExitLaterAsync(desktop, seconds, _shutdown.Token);
@@ -133,11 +157,14 @@ public sealed class App : Application
 
     private void CreateTrayIcon(IClassicDesktopStyleApplicationLifetime desktop)
     {
+        var lyrics = new NativeMenuItem("打开歌词窗口");
+        lyrics.Click += (_, _) => Dispatcher.UIThread.Post(ShowLyricsWindow);
         var settings = new NativeMenuItem("设置");
         settings.Click += (_, _) => Dispatcher.UIThread.Post(ShowSettings);
         var exit = new NativeMenuItem("退出");
         exit.Click += (_, _) => Dispatcher.UIThread.Post(() => desktop.Shutdown());
         var menu = new NativeMenu();
+        menu.Add(lyrics);
         menu.Add(settings);
         menu.Add(exit);
 
@@ -152,6 +179,44 @@ public sealed class App : Application
             Menu = menu,
             IsVisible = true
         };
+        _trayIcon.Clicked += (_, _) => Dispatcher.UIThread.Post(ShowLyricsWindow);
+    }
+
+    private void ShowLyricsWindow()
+    {
+        if (_lyricsWindow is not null)
+        {
+            if (_lyricsWindow.WindowState == WindowState.Minimized)
+                _lyricsWindow.WindowState = WindowState.Normal;
+            _lyricsWindow.Activate();
+            return;
+        }
+        _lyricsWindow = new LyricsWindow(_store!, _settings, _appIcon, ControlPlaybackAsync,
+            ShowSettings, value => ApplySettings(_settings with { ShowTranslation = value }, false),
+            value => ApplySettings(_settings with { ShowIsland = value }, false));
+        _lyricsWindow.Closed += (_, _) => _lyricsWindow = null;
+        _lyricsWindow.Show();
+    }
+
+    private async Task<string?> ControlPlaybackAsync(PlaybackCommand command, CancellationToken cancellationToken)
+    {
+        if (Program.Options.Demo)
+        {
+            var snapshot = _store!.Snapshot;
+            _store.Update(snapshot with
+            {
+                IsPlaying = command.Action == PlaybackAction.PlayPause ? !snapshot.IsPlaying : snapshot.IsPlaying,
+                ReportedPositionMs = command.Action == PlaybackAction.Seek
+                    ? (long)Math.Clamp(command.Value, 0, DemoSource.Track.DurationMs - 1) : (long)snapshot.PositionMs,
+                ReportedAtTimestamp = Stopwatch.GetTimestamp()
+            });
+            return null;
+        }
+        var source = Volatile.Read(ref _playbackSource);
+        if (source is null || _playbackCancellation is null)
+            return "播放信息源尚未连接";
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _playbackCancellation.Token);
+        return await source.ControlAsync(command, linked.Token);
     }
 
     private void ShowSettings()
@@ -192,6 +257,7 @@ public sealed class App : Application
 
         _settings = settings;
         _overlay?.ApplySettings(_settings);
+        _lyricsWindow?.ApplySettings(_settings);
         if (Volatile.Read(ref _playbackSource) is { } source)
         {
             source.SetLyricsSource(_settings.LyricsSource);
@@ -299,10 +365,14 @@ internal static class DemoSource
 
     public static async Task RunAsync(PlaybackStore store, CancellationToken cancellationToken)
     {
+        store.Update(new PlaybackSnapshot(Track, 0, Stopwatch.GetTimestamp(), true, "演示模式")
+        { Controls = new PlaybackControls(true, false, false, true) });
         while (!cancellationToken.IsCancellationRequested)
         {
-            store.Update(new PlaybackSnapshot(Track, 0, Stopwatch.GetTimestamp(), true, "演示模式"));
-            await Task.Delay(TimeSpan.FromMilliseconds(Track.DurationMs), cancellationToken);
+            await Task.Delay(100, cancellationToken);
+            var snapshot = store.Snapshot;
+            if (snapshot.IsPlaying && snapshot.PositionMs >= Track.DurationMs)
+                store.Update(snapshot with { ReportedPositionMs = 0, ReportedAtTimestamp = Stopwatch.GetTimestamp() });
         }
     }
 
