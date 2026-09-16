@@ -75,7 +75,8 @@ internal static class Program
 
     public static AppBuilder BuildAvaloniaApp() => AppBuilder
         .Configure<App>()
-        .UsePlatformDetect();
+        .UsePlatformDetect()
+        .AfterPlatformServicesSetup(_ => RenderScheduling.Initialize(SettingsStore.Load()));
 
     private static int WriteSnapshot(string path)
     {
@@ -134,6 +135,7 @@ public sealed class App : Application
                 _store, _settings, SavePosition, UpdateTrackOffset, ShowSettings, ShowLyricsWindow,
                 () => desktop.Shutdown());
             desktop.MainWindow = _overlay;
+            _overlay.Screens.Changed += (_, _) => RenderScheduling.DisplayChanged();
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             CreateTrayIcon(desktop);
 
@@ -150,7 +152,7 @@ public sealed class App : Application
 
             // Avalonia 12.1.1's Linux D-Bus tray can throw while Dispose cancels its watcher.
             // Process exit releases the D-Bus registration, so keep the icon alive until then.
-            desktop.Exit += (_, _) => _shutdown.Cancel();
+            desktop.Exit += (_, _) => { _shutdown.Cancel(); RenderScheduling.Stop(); };
         }
         base.OnFrameworkInitializationCompleted();
     }
@@ -256,6 +258,7 @@ public sealed class App : Application
         }
 
         _settings = settings;
+        RenderScheduling.Apply(settings);
         _overlay?.ApplySettings(_settings);
         _lyricsWindow?.ApplySettings(_settings);
         if (Volatile.Read(ref _playbackSource) is { } source)

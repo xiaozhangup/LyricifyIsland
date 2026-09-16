@@ -1,13 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <Version>0.1.5</Version>
+    <Version>0.1.6</Version>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <AssemblyName>LyricifyIsland</AssemblyName>
     <RootNamespace>LyricifyIsland</RootNamespace>
+    <!-- RenderScheduling adjusts the X11 render timer in the pinned Avalonia version. -->
+    <AvaloniaAccessUnstablePrivateApis>true</AvaloniaAccessUnstablePrivateApis>
     <!-- Avalonia 12's optional analyzers target newer Roslyn; this app has no XAML generation. -->
     <NoWarn>$(NoWarn);CS9057</NoWarn>
   </PropertyGroup>

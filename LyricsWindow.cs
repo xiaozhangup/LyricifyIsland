@@ -76,7 +76,8 @@ internal sealed class LyricsWindow : Window
         };
         PropertyChanged += (_, args) =>
         {
-            if (args.Property == WindowStateProperty || args.Property == TopmostProperty) UpdateWindowState();
+            if (args.Property == WindowStateProperty || args.Property == TopmostProperty || args.Property == IsVisibleProperty)
+                UpdateWindowState();
             if (args.Property == BoundsProperty || args.Property.Name == "RenderScaling") UpdateInputShape();
         };
         Closed += (_, _) => { _inputShape?.Dispose(); _lyrics.Dispose(); };
@@ -84,10 +85,10 @@ internal sealed class LyricsWindow : Window
 
     private void UpdateInputShape()
     {
-        var fullScreen = WindowState == WindowState.FullScreen;
+        var fillWindow = WindowState is WindowState.FullScreen or WindowState.Maximized;
         var bounds = new Rect(ClientSize);
-        _inputShape?.SetInputRegion(fullScreen ? bounds : bounds.Deflate(10), RenderScaling,
-            cornerRadius: fullScreen ? 0 : 24);
+        _inputShape?.SetInputRegion(fillWindow ? bounds : bounds.Deflate(10), RenderScaling,
+            cornerRadius: fillWindow ? 0 : 24);
     }
 
     private void UpdateWindowState()
@@ -96,6 +97,7 @@ internal sealed class LyricsWindow : Window
         _lyrics.Maximized = WindowState == WindowState.Maximized;
         _lyrics.Pinned = Topmost;
         UpdateInputShape();
+        if (IsVisible && WindowState != WindowState.Minimized) _lyrics.ResumeAnimation();
         _lyrics.InvalidateVisual();
     }
 
@@ -166,6 +168,8 @@ internal sealed class LyricsWindowControl : Control, IDisposable
         InvalidateVisual();
     }
 
+    internal void ResumeAnimation() => QueueFrame();
+
     private void QueueFrame()
     {
         if (_disposed || _queued || TopLevel.GetTopLevel(this) is not { } top) return;
@@ -174,8 +178,8 @@ internal sealed class LyricsWindowControl : Control, IDisposable
         {
             _queued = false;
             if (_disposed || !this.IsAttachedToVisualTree()) return;
-            if (top.IsVisible && (top is not Window window || window.WindowState != WindowState.Minimized))
-                InvalidateVisual();
+            if (!top.IsVisible || top is Window { WindowState: WindowState.Minimized }) return;
+            InvalidateVisual();
             QueueFrame();
         });
     }
@@ -209,7 +213,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
         + (_settings.EnableTrackOffsets ? _settings.TrackOffsetFor(trackId) : 0);
 
     private LyricsWindowLayout Layout => _renderer.Layout
-        ?? LyricsWindowLayout.Create((float)Bounds.Width, (float)Bounds.Height, LyricsOnly, FullScreen);
+        ?? LyricsWindowLayout.Create((float)Bounds.Width, (float)Bounds.Height, LyricsOnly, FullScreen || Maximized);
 
     private void OnPressed(object? sender, PointerPressedEventArgs args)
     {
@@ -467,12 +471,13 @@ internal sealed class LyricsWindowDrawOperation : ICustomDrawOperation
         if (context.TryGetFeature<ISkiaSharpApiLeaseFeature>() is not { } feature) return;
         using var lease = feature.Lease();
         RendererDiagnostics.Observe(lease.GrContext is not null);
+        if (lease.GrContext is not null) NativeVerticalSync.Apply();
         _renderer.Draw(lease.SkCanvas, (float)Bounds.Width, (float)Bounds.Height, _frame);
     }
 
     public bool HitTest(Point point)
     {
-        if (_frame.FullScreen) return Bounds.Contains(point);
+        if (_frame.FullScreen || _frame.Maximized) return Bounds.Contains(point);
         var rect = Bounds.Deflate(10);
         if (!rect.Contains(point)) return false;
         const double radius = 24;

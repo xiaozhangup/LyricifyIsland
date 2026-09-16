@@ -438,6 +438,7 @@ public sealed class IslandControl : Control, IDisposable
     private Rect _pillBounds;
     private PlaybackSnapshot? _renderedSnapshot;
     private bool _animationFrameQueued;
+    private IDisposable? _idleFrame;
     private bool _disposed;
 
     internal Rect PillBounds => _pillBounds;
@@ -454,6 +455,17 @@ public sealed class IslandControl : Control, IDisposable
         if (_disposed || _animationFrameQueued || TopLevel.GetTopLevel(this) is not { } topLevel)
             return;
         _animationFrameQueued = true;
+        var snapshot = _store.Snapshot;
+        if ((!_showIsland || !snapshot.IsPlaying) && _outgoing is null && !_capsuleTransitioning
+            && !_delayedHidePending && ReferenceEquals(snapshot, _renderedSnapshot))
+        {
+            _idleFrame = Avalonia.Threading.DispatcherTimer.RunOnce(() =>
+            {
+                _idleFrame = null;
+                OnAnimationFrame(default);
+            }, TimeSpan.FromMilliseconds(100));
+            return;
+        }
         topLevel.RequestAnimationFrame(OnAnimationFrame);
     }
 
@@ -484,6 +496,13 @@ public sealed class IslandControl : Control, IDisposable
         }
         _pausedDisplay = settings.PausedDisplay;
         _renderer.SetBackgroundOpacity(settings.BackgroundOpacityPercent);
+        if (_idleFrame is not null)
+        {
+            _idleFrame.Dispose();
+            _idleFrame = null;
+            _animationFrameQueued = false;
+            QueueAnimationFrame();
+        }
         InvalidateVisual();
     }
 
@@ -630,6 +649,7 @@ public sealed class IslandControl : Control, IDisposable
     public void Dispose()
     {
         _disposed = true;
+        _idleFrame?.Dispose();
         // Render operations may still be queued on Avalonia's compositor thread.
         // The process owns this renderer; releasing it here can race the final frame.
     }
@@ -653,6 +673,7 @@ internal sealed class IslandDrawOperation(
 
         using var lease = feature.Lease();
         RendererDiagnostics.Observe(lease.GrContext is not null);
+        if (lease.GrContext is not null) NativeVerticalSync.Apply();
         renderer.Draw(lease.SkCanvas, (float)Bounds.Width, (float)Bounds.Height, frame, fullPillBounds);
     }
 

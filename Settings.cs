@@ -53,7 +53,9 @@ internal readonly record struct IslandSettings(
     ImmutableDictionary<string, int>? TrackOffsetsMs = null,
     ImmutableDictionary<string, string>? TrackOffsetTitles = null,
     PlaybackSourcePreference PlaybackSource = PlaybackSourcePreference.Spotify,
-    bool ShowIsland = true)
+    bool ShowIsland = true,
+    int MaximumFrameRate = 0,
+    VerticalSyncMode VerticalSync = VerticalSyncMode.Enabled)
 {
     public bool HasSpotifyCredentials =>
         !string.IsNullOrWhiteSpace(SpotifyClientId)
@@ -118,6 +120,9 @@ internal static class SettingsStore
     public const double MinimumBackgroundOpacityPercent = 35d;
     public const double MaximumBackgroundOpacityPercent = 95d;
     public const int DefaultTemporaryHideSeconds = 2;
+    public const int MinimumFrameRate = 30;
+    public const int MaximumFrameRate = 360;
+    public const int UnlimitedFrameRateSliderValue = MaximumFrameRate + 1;
 
     public static IslandSettings Load()
     {
@@ -156,7 +161,9 @@ internal static class SettingsStore
                 data?.TrackOffsetsMs?.ToImmutableDictionary(StringComparer.Ordinal),
                 data?.TrackOffsetTitles?.ToImmutableDictionary(StringComparer.Ordinal),
                 data?.PlaybackSource ?? PlaybackSourcePreference.Spotify,
-                data?.ShowIsland ?? true));
+                data?.ShowIsland ?? true,
+                data?.MaximumFrameRate ?? 0,
+                data?.VerticalSync ?? VerticalSyncMode.Enabled));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -203,7 +210,9 @@ internal static class SettingsStore
                     TrackOffsetsMs = settings.TrackOffsetsMs?.ToDictionary(),
                     TrackOffsetTitles = settings.TrackOffsetTitles?.ToDictionary(),
                     PlaybackSource = settings.PlaybackSource,
-                    ShowIsland = settings.ShowIsland
+                    ShowIsland = settings.ShowIsland,
+                    MaximumFrameRate = settings.MaximumFrameRate,
+                    VerticalSync = settings.VerticalSync
                 }));
             Secure(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             File.Move(temporary, path, overwrite: true);
@@ -243,6 +252,9 @@ internal static class SettingsStore
         ? value
         : DefaultTemporaryHideSeconds;
 
+    internal static int NormalizeFrameRate(int value) => value <= 0 ? 0
+        : Math.Clamp(value, MinimumFrameRate, MaximumFrameRate);
+
     internal static IslandSettings Normalize(IslandSettings settings)
     {
         var offsets = NormalizeTrackOffsets(settings.TrackOffsetsMs);
@@ -265,6 +277,8 @@ internal static class SettingsStore
                 ? settings.PlaybackSource
                 : PlaybackSourcePreference.Spotify,
             TemporaryHideSeconds = NormalizeTemporaryHideSeconds(settings.TemporaryHideSeconds),
+            MaximumFrameRate = NormalizeFrameRate(settings.MaximumFrameRate),
+            VerticalSync = Enum.IsDefined(settings.VerticalSync) ? settings.VerticalSync : VerticalSyncMode.Enabled,
             DisplayId = string.IsNullOrWhiteSpace(settings.DisplayId) ? null : settings.DisplayId.Trim(),
             WindowX = settings.RememberPosition ? settings.WindowX : null,
             WindowY = settings.RememberPosition ? settings.WindowY : null,
@@ -350,6 +364,8 @@ internal static class SettingsStore
         public Dictionary<string, string>? TrackOffsetTitles { get; init; }
         public PlaybackSourcePreference? PlaybackSource { get; init; }
         public bool? ShowIsland { get; init; }
+        public int? MaximumFrameRate { get; init; }
+        public VerticalSyncMode? VerticalSync { get; init; }
     }
 }
 
@@ -460,6 +476,40 @@ internal sealed class SettingsWindow : Window
             settings = updated;
             return true;
         }
+
+        var syncChoices = new[]
+        {
+            new Choice<VerticalSyncMode>(VerticalSyncMode.Disabled, "无"),
+            new Choice<VerticalSyncMode>(VerticalSyncMode.Enabled, "垂直同步"),
+            new Choice<VerticalSyncMode>(VerticalSyncMode.Adaptive, "自适应垂直同步")
+        };
+        var rendering = CreateCard(
+            BehaviorIcon,
+            "渲染",
+            "同时应用于歌词窗口和灵动岛，修改后立即生效",
+            body: CreateSettingsBody(
+                CreateSettingRow(
+                    "最大刷新率",
+                    "降低上限可减少占用，滑到最右侧为无限制",
+                    CreateSlider(
+                        "最大刷新率",
+                        SettingsStore.MinimumFrameRate,
+                        SettingsStore.UnlimitedFrameRateSliderValue,
+                        settings.MaximumFrameRate == 0 ? SettingsStore.UnlimitedFrameRateSliderValue : settings.MaximumFrameRate,
+                        10,
+                        value => value >= SettingsStore.UnlimitedFrameRateSliderValue ? "无限制" : $"{value:0} FPS",
+                        value => Commit(settings with
+                        {
+                            MaximumFrameRate = value >= SettingsStore.UnlimitedFrameRateSliderValue ? 0 : (int)value
+                        }))),
+                CreateSettingRow(
+                    "垂直同步",
+                    "自适应模式在驱动不支持时使用普通垂直同步；实际呈现仍受桌面合成器影响",
+                    CreateChoice(
+                        "垂直同步方式",
+                        syncChoices,
+                        syncChoices.First(choice => choice.Value == settings.VerticalSync),
+                        value => Commit(settings with { VerticalSync = value })))));
 
         var appearance = CreateCard(
             ScaleIcon,
@@ -1119,7 +1169,7 @@ internal sealed class SettingsWindow : Window
                 Margin = new Thickness(10),
                 Spacing = 8,
                 HorizontalAlignment = HorizontalAlignment.Stretch,
-                Children = { appearance, lyrics, position, behavior, playbackSource, cache }
+                Children = { appearance, rendering, lyrics, position, behavior, playbackSource, cache }
             }
         };
     }

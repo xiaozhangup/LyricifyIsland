@@ -27,11 +27,11 @@ internal sealed record LyricsWindowLayout(Rect Surface, Rect Lyrics, Rect Cover,
 {
     public float PlayerScale { get; init; } = 1;
 
-    public static LyricsWindowLayout Create(float width, float height, bool lyricsOnly, bool fullScreen = false)
+    public static LyricsWindowLayout Create(float width, float height, bool lyricsOnly, bool fillWindow = false)
     {
         var compact = width < 840 || height < 580;
         var playerScale = compact ? 1 : Math.Clamp(Math.Min(width / 1120, height / 720), 1, 2);
-        var surface = fullScreen ? new Rect(0, 0, width, height) : new Rect(10, 10, width - 20, height - 20);
+        var surface = fillWindow ? new Rect(0, 0, width, height) : new Rect(10, 10, width - 20, height - 20);
         if (compact || lyricsOnly)
         {
             var margin = lyricsOnly ? Math.Clamp(width * .14, 48, 180) : 48;
@@ -174,8 +174,9 @@ internal sealed class LyricsWindowRenderer : IDisposable
             var dt = _lastSeconds == 0 ? 1d / 60 : Math.Clamp(frame.Seconds - _lastSeconds, 0, .05);
             _frameDelta = dt;
             _lastSeconds = frame.Seconds;
-            var normal = LyricsWindowLayout.Create(width, height, false, frame.FullScreen);
-            var lyricsOnly = LyricsWindowLayout.Create(width, height, true, frame.FullScreen);
+            var fillWindow = frame.FullScreen || frame.Maximized;
+            var normal = LyricsWindowLayout.Create(width, height, false, fillWindow);
+            var lyricsOnly = LyricsWindowLayout.Create(width, height, true, fillWindow);
             var target = frame.LyricsOnly ? 1d : 0;
             _lyricsOnlyProgress = _publishedLayout is null ? target
                 : Approach(_lyricsOnlyProgress, target, dt, 10);
@@ -191,7 +192,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
             _hits.Clear();
             canvas.Save();
             var rect = ToSk(layout.Surface);
-            if (frame.FullScreen)
+            if (fillWindow)
                 canvas.ClipRect(rect);
             else
             {
@@ -212,7 +213,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 Label(canvas, toast, toastRect.Left + 16, toastRect.Top + 11, 13,
                     White(235), toastWidth - 32);
             }
-            if (!frame.FullScreen)
+            if (!fillWindow)
             {
                 using var rim = Paint(White(30));
                 rim.Style = SKPaintStyle.Stroke;
