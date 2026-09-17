@@ -7,7 +7,7 @@ namespace LyricifyIsland;
 internal enum LyricsWindowAction
 {
     None, Minimize, Maximize, Close, Pin, FullScreen, Translation, LyricsOnly, Settings,
-    Previous, PlayPause, Next, Shuffle, Repeat, Seek, Volume, Lyric, Follow, Island
+    Previous, PlayPause, Next, Shuffle, Repeat, Seek, Volume, Lyric, Follow, Island, Favorite
 }
 
 internal sealed record LyricsWindowHit(LyricsWindowAction Action, Rect Bounds, bool Enabled = true, int Line = -1);
@@ -59,6 +59,8 @@ internal sealed record LyricsWindowLayout(Rect Surface, Rect Lyrics, Rect Cover,
 
 internal sealed class LyricsWindowRenderer : IDisposable
 {
+    // Match the secondary player buttons, with about 8 px of space around the 20 px icon.
+    private const float FavoriteButtonSize = 36;
     private const float LyricHorizontalPadding = 20;
     private const double BackgroundTransitionSeconds = .85;
 
@@ -204,6 +206,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
             DrawHeader(canvas, width, frame);
             DrawPlayer(canvas, layout, frame, dt);
             DrawLyrics(canvas, layout, frame, dt);
+            DrawFavorite(canvas, layout, frame);
             if (frame.Toast is { Length: > 0 } toast)
             {
                 var toastWidth = Math.Min(width - 80, 660);
@@ -483,8 +486,9 @@ internal sealed class LyricsWindowRenderer : IDisposable
             canvas.Restore();
             var tx = layout.Compact ? cover.Right + 22 * playerScale : cover.Left;
             var ty = layout.Compact ? cover.Top + 1 : cover.Bottom + 28 * playerScale;
-            var tw = layout.Compact ? (float)layout.Surface.Width - tx - 44 * playerScale : cover.Width - 6 * playerScale;
-            Label(canvas, track?.Title ?? "等待播放", tx, ty, (layout.Compact ? 21 : 23) * playerScale, White(245), tw, true);
+            var title = track?.Title ?? "等待播放";
+            var tw = (float)MetadataFavoriteBounds(layout).Left - tx - 12 * playerScale;
+            Label(canvas, title, tx, ty, (layout.Compact ? 21 : 23) * playerScale, White(245), tw, true);
             Label(canvas, track is null ? "在播放器中播放一首歌" : string.Join(" / ", track.Artists),
                 tx, ty + 33 * playerScale, 15 * playerScale, White(150), tw);
             if (layout.Compact)
@@ -533,6 +537,50 @@ internal sealed class LyricsWindowRenderer : IDisposable
             Slider(canvas, LyricsWindowAction.Volume, volumeBounds, frame.VolumePreview ?? volume,
                 !frame.Busy && metadataOpacity > .2, frame, playerScale);
             canvas.Restore();
+        }
+    }
+
+    private static Rect MetadataFavoriteBounds(LyricsWindowLayout layout)
+    {
+        var scale = layout.PlayerScale;
+        var right = layout.Compact ? layout.Surface.Right - 38 * scale : layout.Cover.Right;
+        var size = FavoriteButtonSize * scale;
+        // The visible icon is 20 px wide; the hover background extends beyond the cover edge.
+        var left = right - 10 * scale - size / 2;
+        var centerY = layout.Compact ? layout.Cover.Top + 29 * scale : layout.Cover.Bottom + 56 * scale;
+        return new Rect(left, centerY - size / 2, size, size);
+    }
+
+    private void DrawFavorite(SKCanvas canvas, LyricsWindowLayout layout, LyricsWindowFrame frame)
+    {
+        var scale = layout.PlayerScale;
+        var controls = frame.Snapshot.Controls;
+        // Keep the action available beside transport when lyrics-only mode hides the song information.
+        var size = FavoriteButtonSize * scale;
+        var lyricsOnlyBounds = new Rect(layout.Transport.Right + 16 * scale,
+            layout.Transport.Center.Y - size / 2, size, size);
+        var favoriteBounds = Mix(MetadataFavoriteBounds(layout).Translate(MetadataOffset(layout)),
+            lyricsOnlyBounds, _lyricsOnlyProgress);
+        var canFavorite = controls.CanFavorite && !frame.Busy;
+        Button(canvas, LyricsWindowAction.Favorite, favoriteBounds, "addCircle",
+            frame, canFavorite, controls.IsFavorite == true, 24 * scale, scale);
+        var favoriteHover = !canFavorite && favoriteBounds.Contains(frame.Pointer)
+            ? 1 : _buttonMotion[LyricsWindowAction.Favorite].Hover;
+        if (favoriteHover > .01)
+        {
+            var label = !controls.CanFavorite ? "当前曲目或音源不支持收藏"
+                : frame.Busy ? "操作处理中…"
+                : controls.IsFavorite == true ? "取消收藏"
+                : controls.IsFavorite == false ? "添加到喜欢的歌曲" : "收藏状态未知，点击添加";
+            var fontSize = 11 * scale;
+            var tooltipWidth = GetLabel(label, fontSize, (float)layout.Surface.Width - 40).InkBounds.Width + 24 * scale;
+            var left = (float)Math.Clamp(favoriteBounds.Center.X - tooltipWidth / 2,
+                layout.Surface.Left + 8, layout.Surface.Right - tooltipWidth - 8);
+            var bottom = (float)favoriteBounds.Top - 8 * scale;
+            var tooltip = new SKRect(left, bottom - 26 * scale, left + tooltipWidth, bottom);
+            using var paint = Paint(new SKColor(16, 20, 28, (byte)(225 * favoriteHover)));
+            canvas.DrawRoundRect(tooltip, 8 * scale, 8 * scale, paint);
+            CenteredLabel(canvas, label, tooltip, fontSize, White((byte)(210 * favoriteHover)));
         }
     }
 
@@ -852,15 +900,31 @@ internal sealed class LyricsWindowRenderer : IDisposable
         LyricsWindowFrame frame, bool enabled, bool active, float size, float scale = 1)
     {
         var motion = AnimateControl(action, bounds, frame, enabled, active);
-        var backgroundAlpha = 26 * motion.Active * (.45 + .55 * motion.Enabled) + 16 * motion.Hover + 20 * motion.Pressed;
+        var favorite = action == LyricsWindowAction.Favorite;
+        var backgroundAlpha = (favorite ? 0 : 26 * motion.Active * (.45 + .55 * motion.Enabled))
+            + (favorite ? 22 : 16) * motion.Hover + 20 * motion.Pressed;
         if (backgroundAlpha > .5)
         {
             using var paint = Paint(action == LyricsWindowAction.Close
                 ? new SKColor(228, 76, 91, (byte)(175 * motion.Hover)) : White((byte)backgroundAlpha));
-            canvas.DrawRoundRect(ToSk(bounds), 9 * scale, 9 * scale, paint);
+            if (favorite)
+                canvas.DrawCircle((float)bounds.Center.X, (float)bounds.Center.Y, (float)bounds.Width / 2, paint);
+            else
+                canvas.DrawRoundRect(ToSk(bounds), 9 * scale, 9 * scale, paint);
         }
-        Icon(canvas, icon, (float)bounds.Center.X, (float)bounds.Center.Y, size,
-            White((byte)Mix(48, 185 + 60 * Math.Max(motion.Hover, motion.Active), motion.Enabled)));
+        var iconColor = White((byte)Mix(48, 185 + 60 * Math.Max(motion.Hover, motion.Active), motion.Enabled));
+        if (favorite)
+        {
+            var iconSize = size * (float)(1 + .04 * motion.Hover - .08 * motion.Pressed);
+            // Keep the icon's right edge aligned while its hover/press animation changes its size.
+            var iconX = (float)bounds.Center.X + (size - iconSize) * 10 / 24;
+            Icon(canvas, "addCircle", iconX, (float)bounds.Center.Y, iconSize,
+                iconColor.WithAlpha((byte)(iconColor.Alpha * (1 - motion.Active))));
+            Icon(canvas, "checkCircle", iconX, (float)bounds.Center.Y, iconSize,
+                iconColor.WithAlpha((byte)(iconColor.Alpha * motion.Active)));
+        }
+        else
+            Icon(canvas, icon, (float)bounds.Center.X, (float)bounds.Center.Y, size, iconColor);
         if (motion.Active > .01 && action is LyricsWindowAction.Repeat or LyricsWindowAction.Shuffle)
         {
             using var paint = Paint(White((byte)((80 + 150 * motion.Enabled) * motion.Active)));
@@ -974,6 +1038,21 @@ internal sealed class LyricsWindowRenderer : IDisposable
             case "play": Triangle(-6, -10, 10, 0, -6, 10); break;
             case "next": Triangle(-10, -8, 1, 0, -10, 8); Triangle(1, -8, 12, 0, 1, 8); break;
             case "previous": Triangle(10, -8, -1, 0, 10, 8); Triangle(-1, -8, -12, 0, -1, 8); break;
+            case "addCircle":
+                canvas.DrawCircle(0, 0, 10 - paint.StrokeWidth / 2, paint);
+                Line(-4.2f, 0, 4.2f, 0); Line(0, -4.2f, 0, 4.2f);
+                break;
+            case "checkCircle":
+                paint.Style = SKPaintStyle.Stroke;
+                paint.StrokeWidth = 2.1f;
+                path.MoveTo(-4.2f, .2f);
+                path.LineTo(-1.2f, 3.2f);
+                path.LineTo(4.7f, -3.4f);
+                using (var cutout = paint.GetFillPath(path))
+                    canvas.ClipPath(cutout, SKClipOperation.Difference, true);
+                paint.Style = SKPaintStyle.Fill;
+                canvas.DrawCircle(0, 0, 10, paint);
+                break;
             case "shuffle": Path((-9, -6), (-5, -6), (5, 6), (10, 6)); Path((6, 2), (10, 6), (6, 10));
                 Path((-9, 6), (-5, 6), (5, -6), (10, -6)); Path((6, -10), (10, -6), (6, -2)); break;
             case "repeat": case "repeatOne":

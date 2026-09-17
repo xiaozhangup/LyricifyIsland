@@ -66,6 +66,9 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 - 滚轮或拖动歌词浏览，停止操作 5 秒后恢复跟随，也可点击“回到当前歌词”。
 - 点击歌词跳到对应时间；进度条和音量条支持拖动。
 - 播放 / 暂停、上一首、下一首、随机和循环控制当前音源，不支持的操作会变灰。
+- 歌曲信息右侧的收藏按钮可将 Spotify 当前歌曲加入「喜欢的歌曲」，再次点击可取消收藏；未收藏为白色圆圈加号，已收藏为白色圆形，中央勾号镂空透出背景。
+  收藏图标位于歌名与歌手信息右侧的竖直居中位置，图标自身的右边缘与专辑封面右边缘对齐；纯歌词模式下移到播放控件旁。按钮平时无额外底色，悬浮和按下时显示轻微高亮。
+  切歌时读取收藏状态，状态未知时点击只会添加收藏。MPRIS、本地文件和非歌曲内容不支持此操作，按钮会变灰。
 - 顶栏可切换翻译、纯歌词、灵动岛显示、置顶和全屏，并打开原有设置。
   灵动岛开关会保存，重启后继续生效；翻译与歌词偏移和歌词岛共用。
 - 空格播放 / 暂停，左右方向键快退 / 快进 5 秒，上下方向键浏览歌词，Home 恢复跟随，
@@ -75,6 +78,9 @@ Spotify 开发模式下，还需要在 Dashboard 中把登录所用 Spotify 账�
 Spotify 播放控制使用官方 API，需要 Premium 与 `user-modify-playback-state` 权限；
 旧版本的只读授权在首次点击播放控件时会打开浏览器申请新增权限，单纯显示歌词不触发重新授权。
 相关限制见 [Spotify 播放控制文档](https://developer.spotify.com/documentation/web-api/reference/start-a-users-playback)。
+收藏使用 `user-library-read` 和 `user-library-modify` 权限；旧账号首次点击收藏按钮时会打开浏览器补充授权，
+授权期间切歌后需要重新点击。收藏通过 [Spotify Library API](https://developer.spotify.com/documentation/web-api/reference/save-library-items)
+同步到账户，操作成功后才更新收藏图标状态。
 
 ## 本地验收
 

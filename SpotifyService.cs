@@ -13,7 +13,10 @@ internal sealed class SpotifyService : IPlaybackSource
 {
     private const string RedirectUri = "http://127.0.0.1:43821/callback";
     private const string ControlScope = "user-modify-playback-state";
-    private const string Scope = "user-read-currently-playing user-read-playback-state " + ControlScope;
+    private const string LibraryReadScope = "user-library-read";
+    private const string LibraryModifyScope = "user-library-modify";
+    private const string Scope = "user-read-currently-playing user-read-playback-state " + ControlScope
+        + " " + LibraryReadScope + " " + LibraryModifyScope;
     private const string CurrentlyPlayingUrl = "https://api.spotify.com/v1/me/player?additional_types=track";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(750);
     private const long CrossfadeTransitionSlackMs = 1_500;
@@ -33,6 +36,10 @@ internal sealed class SpotifyService : IPlaybackSource
     private int _positionSyncedVersion;
     private int _lyricsSource;
     private int _refreshCurrentTrack;
+    private string? _favoriteUri;
+    private bool? _isFavorite;
+    private bool _favoriteReadPending;
+    private DateTimeOffset _libraryRetryAt;
 
     public SpotifyService(
         PlaybackStore store,
@@ -240,8 +247,35 @@ internal sealed class SpotifyService : IPlaybackSource
                     ? "正在获取歌词…"
                     : $"未找到歌词 · {string.Join(", ", currentTrack.Artists)}"
                 : string.Join(", ", currentTrack.Artists);
+            var favoriteUri = GetFavoriteUri(item);
+            if (_favoriteUri != favoriteUri)
+            {
+                _favoriteUri = favoriteUri;
+                _isFavorite = null;
+                _favoriteReadPending = true;
+            }
+            var controls = ReadControls(root, isPlaying, currentTrack.DurationMs) with
+            { CanFavorite = favoriteUri is not null, IsFavorite = _isFavorite };
             _store.Update(new PlaybackSnapshot(currentTrack, position, reportedAt, isPlaying, status)
-            { Controls = ReadControls(root, isPlaying, currentTrack.DurationMs) });
+            { Controls = controls });
+            // Read once per song, after publishing playback so a slow library request cannot hide the new song.
+            // Old logins remain usable without opening an authorization page just to display lyrics.
+            if (favoriteUri is not null && _favoriteReadPending && HasScope(LibraryReadScope)
+                && DateTimeOffset.UtcNow >= _libraryRetryAt)
+            {
+                _favoriteReadPending = false;
+                try
+                {
+                    _isFavorite = await ReadFavoriteAsync(favoriteUri, cancellationToken);
+                    var snapshot = _store.Snapshot;
+                    _store.Update(snapshot with { Controls = snapshot.Controls with { IsFavorite = _isFavorite } });
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                catch (Exception exception)
+                {
+                    Console.Error.WriteLine($"[spotify] 收藏状态读取失败：{Friendly(exception)}");
+                }
+            }
             return PollInterval;
         }
     }
@@ -272,6 +306,8 @@ internal sealed class SpotifyService : IPlaybackSource
         {
             if (_tokens is null)
                 return "请先连接 Spotify";
+            if (command.Action == PlaybackAction.Favorite)
+                return await SetFavoriteAsync(command, cancellationToken);
             // Existing read-only logins keep working; request the extra scope only on a control action.
             if (_tokens.GrantedScope?.Split(' ').Contains(ControlScope) != true)
             {
@@ -324,8 +360,102 @@ internal sealed class SpotifyService : IPlaybackSource
             return null;
         }
         catch (OperationCanceledException) { throw; }
-        catch (Exception exception) { return $"播放控制失败：{Friendly(exception)}"; }
+        catch (Exception exception)
+        {
+            return $"{(command.Action == PlaybackAction.Favorite ? "收藏操作" : "播放控制")}失败：{Friendly(exception)}";
+        }
         finally { _playerGate.Release(); }
+    }
+
+    private bool HasScope(string scope) => _tokens?.GrantedScope?.Split(' ').Contains(scope) == true;
+
+    private static string? GetFavoriteUri(JsonElement item)
+    {
+        var id = GetString(item, "id");
+        return GetString(item, "type") == "track" && !GetBoolean(item, "is_local")
+            && id is { Length: 22 } && id.All(char.IsAsciiLetterOrDigit) ? "spotify:track:" + id : null;
+    }
+
+    // Called under _playerGate, together with polling and token refreshes.
+    private async Task<string?> SetFavoriteAsync(PlaybackCommand command, CancellationToken cancellationToken)
+    {
+        if (command.TrackId is null || command.TrackId != _store.Snapshot.Track?.Id)
+            return "歌曲已切换，请重试";
+        if (_favoriteUri is null)
+            return "当前曲目不支持 Spotify 收藏";
+        if (!HasScope(LibraryReadScope) || !HasScope(LibraryModifyScope))
+        {
+            using var authorization = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            authorization.CancelAfter(TimeSpan.FromMinutes(2));
+            _tokens = await AuthorizeAsync(authorization.Token);
+            _favoriteReadPending = true;
+            var pollStartedAt = Stopwatch.GetTimestamp();
+            await PollAsync(cancellationToken);
+            if (!HasScope(LibraryReadScope) || !HasScope(LibraryModifyScope))
+                return "Spotify 未授予收藏权限，请重新授权";
+            if (_store.Snapshot.ReportedAtTimestamp < pollStartedAt)
+                return "无法确认当前歌曲，请稍后重试";
+        }
+        if (command.TrackId != _store.Snapshot.Track?.Id || _favoriteUri is null)
+            return "歌曲已切换，请重试";
+
+        // The UI sends an explicit desired state. An unknown state always means add, never remove.
+        var saved = command.Value > 0;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        using var response = await SendLibraryAsync(saved ? HttpMethod.Put : HttpMethod.Delete,
+            "?uris=" + Uri.EscapeDataString(_favoriteUri), timeout.Token);
+        _isFavorite = saved;
+        _favoriteReadPending = false;
+        var snapshot = _store.Snapshot;
+        _store.Update(snapshot with { Controls = snapshot.Controls with { IsFavorite = saved } });
+        return null;
+    }
+
+    private async Task<bool> ReadFavoriteAsync(string uri, CancellationToken cancellationToken)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(5));
+        using var response = await SendLibraryAsync(HttpMethod.Get,
+            "/contains?uris=" + Uri.EscapeDataString(uri), timeout.Token);
+        await using var body = await response.Content.ReadAsStreamAsync(timeout.Token);
+        using var json = await JsonDocument.ParseAsync(body, cancellationToken: timeout.Token);
+        if (json.RootElement.ValueKind != JsonValueKind.Array || json.RootElement.GetArrayLength() != 1
+            || json.RootElement[0].ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            throw new InvalidOperationException("Spotify 返回的收藏状态无效");
+        return json.RootElement[0].GetBoolean();
+    }
+
+    private async Task<HttpResponseMessage> SendLibraryAsync(HttpMethod method, string query,
+        CancellationToken cancellationToken)
+    {
+        if (DateTimeOffset.UtcNow < _libraryRetryAt)
+            throw new InvalidOperationException("Spotify 请求过于频繁，请稍后重试");
+        if (_tokens!.ExpiresAt <= DateTimeOffset.UtcNow.AddSeconds(30))
+            _tokens = await RefreshAsync(cancellationToken);
+        for (var attempt = 0; ; attempt++)
+        {
+            using var request = new HttpRequestMessage(method, "https://api.spotify.com/v1/me/library" + query);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _tokens.AccessToken);
+            var response = await Http.SendAsync(request, cancellationToken);
+            if (response.IsSuccessStatusCode) return response;
+            var status = response.StatusCode;
+            if ((int)status == 429) _libraryRetryAt = DateTimeOffset.UtcNow + RetryAfter(response);
+            response.Dispose();
+            if (status == HttpStatusCode.Unauthorized && attempt == 0)
+            {
+                _tokens = await RefreshAsync(cancellationToken);
+                continue;
+            }
+            throw new InvalidOperationException(status switch
+            {
+                HttpStatusCode.Forbidden => "Spotify 拒绝收藏访问，请检查账号与应用的访问权限",
+                HttpStatusCode.Unauthorized => "Spotify 授权已失效，请在设置中重新连接",
+                HttpStatusCode.BadRequest or HttpStatusCode.NotFound => "当前曲目无法加入 Spotify 收藏",
+                (HttpStatusCode)429 => "Spotify 请求过于频繁，请稍后重试",
+                _ => $"Spotify 收藏请求失败（{(int)status}）"
+            });
+        }
     }
 
     private async Task CompleteTrackAsync(
@@ -412,6 +542,9 @@ internal sealed class SpotifyService : IPlaybackSource
         CancelTrackLoad();
         Volatile.Write(ref _track, null);
         _crossfadeOffsetMs = 0;
+        _favoriteUri = null;
+        _isFavorite = null;
+        _favoriteReadPending = false;
     }
 
     private long? ApplyCrossfadeOffset(

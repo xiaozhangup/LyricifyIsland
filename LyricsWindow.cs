@@ -237,7 +237,8 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             args.Pointer.Capture(this);
             UpdateSlider(point);
         }
-        else if (Layout.Lyrics.Contains(point) && _pressed?.Action != LyricsWindowAction.Follow)
+        else if (Layout.Lyrics.Contains(point)
+            && _pressed?.Action is not (LyricsWindowAction.Follow or LyricsWindowAction.Favorite))
         {
             _draggingLyrics = true;
             _browseOrigin = _browseScroll ?? _renderer.ScrollTarget;
@@ -364,6 +365,10 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             case LyricsWindowAction.PlayPause: Send(PlaybackAction.PlayPause); break;
             case LyricsWindowAction.Previous: Send(PlaybackAction.Previous); break;
             case LyricsWindowAction.Next: Send(PlaybackAction.Next); break;
+            case LyricsWindowAction.Favorite:
+                if (snapshot.Controls.CanFavorite)
+                    Send(PlaybackAction.Favorite, snapshot.Controls.IsFavorite == true ? 0 : 1);
+                break;
             case LyricsWindowAction.Shuffle: Send(PlaybackAction.Shuffle, snapshot.Controls.Shuffle == true ? 0 : 1); break;
             case LyricsWindowAction.Repeat:
                 Send(PlaybackAction.Repeat, snapshot.Controls.Repeat switch { "off" => 1, "context" => 2, _ => 0 }); break;
@@ -388,9 +393,18 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             if (_disposed) return;
             if (error is not null) Toast(error);
             else if (command.Action == PlaybackAction.Seek) _browseScroll = null;
+            else if (command.Action == PlaybackAction.Favorite)
+                Toast(command.Value > 0 ? "已加入喜欢的歌曲" : "已取消收藏");
         }
-        catch (OperationCanceledException) { if (!_disposed) Toast("播放操作已取消或超时"); }
-        catch (Exception) { if (!_disposed) Toast("播放控制失败，请检查播放器连接"); }
+        catch (OperationCanceledException)
+        {
+            if (!_disposed) Toast(command.Action == PlaybackAction.Favorite ? "收藏操作已取消或超时" : "播放操作已取消或超时");
+        }
+        catch (Exception)
+        {
+            if (!_disposed) Toast(command.Action == PlaybackAction.Favorite
+                ? "收藏操作失败，请检查 Spotify 连接" : "播放控制失败，请检查播放器连接");
+        }
         finally { _busy = false; if (!_disposed) InvalidateVisual(); }
     }
 

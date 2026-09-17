@@ -60,7 +60,7 @@ internal interface IPlaybackSource
     Task<string?> ControlAsync(PlaybackCommand command, CancellationToken cancellationToken);
 }
 
-internal enum PlaybackAction { PlayPause, Previous, Next, Seek, Shuffle, Repeat, Volume }
+internal enum PlaybackAction { PlayPause, Previous, Next, Seek, Shuffle, Repeat, Volume, Favorite }
 
 internal sealed record PlaybackCommand(PlaybackAction Action, double Value = 0, string? TrackId = null);
 
@@ -71,7 +71,9 @@ public sealed record PlaybackControls(
     bool CanSeek = false,
     bool? Shuffle = null,
     string? Repeat = null,
-    double? Volume = null);
+    double? Volume = null,
+    bool CanFavorite = false,
+    bool? IsFavorite = null);
 
 public sealed class PlaybackStore
 {
