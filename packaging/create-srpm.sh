@@ -34,7 +34,7 @@ export DOTNET_CLI_HOME="$work_dir/dotnet-home"
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 export NUGET_PACKAGES="${NUGET_PACKAGES:-$work_dir/nuget-packages}"
-dotnet restore "$source_dir/LyricifyIsland.csproj" --runtime "fedora.$(rpm --eval '%{fedora}')-x64" -p:SelfContained=false -p:NuGetAudit=false
+dotnet restore "$source_dir/LyricifyIsland.csproj" -p:SelfContained=false -p:NuGetAudit=false
 
 python3 - "$source_dir/obj/project.assets.json" "$NUGET_PACKAGES" "$work_dir/nuget-feed" <<'PY'
 import json
@@ -58,4 +58,4 @@ tar -cf "$topdir/SOURCES/lyricify-island-nuget-$version.tar" -C "$work_dir" nuge
 sed -e "s/^Version:.*/Version:        $version/" \
     -e "s/^Release:.*/Release:        $release%{?dist}/" \
     "$project_dir/packaging/lyricify-island.spec" > "$topdir/SPECS/lyricify-island.spec"
-rpmbuild -bs --define "_topdir $topdir" --define "_srcrpmdir $output_dir" "$topdir/SPECS/lyricify-island.spec"
+rpmbuild -bs --target x86_64 --define "_topdir $topdir" --define "_srcrpmdir $output_dir" "$topdir/SPECS/lyricify-island.spec"
