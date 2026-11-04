@@ -21,6 +21,11 @@ replace_once(
     '\t\t<PackageReference Include="CHTCHSConv" Version="1.0.0" />\n',
     "",
 )
+replace_once(
+    helper / "Lyricify.Lyrics.Helper.csproj",
+    "<TargetFrameworks>netstandard2.1</TargetFrameworks>",
+    "<TargetFrameworks>net10.0</TargetFrameworks>",
+)
 
 source = helper / "Helpers/General/ChineseHelper.cs"
 for direction, method in (("SimplifiedToTraditional", "ToTraditional"),
