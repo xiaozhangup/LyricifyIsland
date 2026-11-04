@@ -1,14 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <Version>0.1.7</Version>
+    <Version>0.1.11</Version>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <AssemblyName>LyricifyIsland</AssemblyName>
     <RootNamespace>LyricifyIsland</RootNamespace>
-    <!-- RenderScheduling adjusts the X11 render timer in the pinned Avalonia version. -->
+    <!-- The Wayland accessibility bridge uses Avalonia's internal automation root API. -->
     <AvaloniaAccessUnstablePrivateApis>true</AvaloniaAccessUnstablePrivateApis>
     <!-- Avalonia 12's optional analyzers target newer Roslyn; this app has no XAML generation. -->
     <NoWarn>$(NoWarn);CS9057</NoWarn>
@@ -18,15 +18,19 @@
     <Compile Remove="vendor/**/*.cs" />
     <PackageReference Include="Avalonia" Version="12.1.1" />
     <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
+    <PackageReference Include="Avalonia.FreeDesktop.AtSpi" Version="12.1.1" />
+    <PackageReference Include="Avalonia.Wayland" Version="12.1.1" />
     <PackageReference Include="Avalonia.Skia" Version="12.1.1" />
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
     <PackageReference Include="QRCoder" Version="1.7.0" />
+    <PackageReference Include="NWayland" Version="0.11.0" />
     <PackageReference Include="SkiaSharp" Version="3.119.4" />
     <PackageReference Include="Tmds.DBus.Protocol" Version="0.94.1" />
     <ProjectReference Include="vendor/Lyricify-Lyrics-Helper/Lyricify.Lyrics.Helper/Lyricify.Lyrics.Helper.csproj" />
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Resources/Headphones/*.json" LogicalName="LyricifyIsland.Headphones.%(Filename)%(Extension)" />
     <EmbeddedResource
       Include="vendor/Lyricify-Lyrics-Helper/Lyricify.Lyrics.Helper/Resources/icon.png"
       LogicalName="LyricifyIsland.icon.png" />

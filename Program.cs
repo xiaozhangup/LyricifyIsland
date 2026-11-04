@@ -16,6 +16,7 @@ namespace LyricifyIsland;
 internal sealed record LaunchOptions(bool Demo, string? SnapshotPath, double? ExitAfterSeconds)
 {
     public bool LyricsWindow { get; init; }
+    public bool Headphones { get; init; }
     public static LaunchOptions Parse(string[] args)
     {
         string? ValueAfter(string name)
@@ -26,7 +27,7 @@ internal sealed record LaunchOptions(bool Demo, string? SnapshotPath, double? Ex
 
         var exitAfter = double.TryParse(ValueAfter("--exit-after"), out var seconds) ? (double?)seconds : null;
         return new LaunchOptions(args.Contains("--demo"), ValueAfter("--snapshot"), exitAfter)
-        { LyricsWindow = args.Contains("--lyrics-window") };
+        { LyricsWindow = args.Contains("--lyrics-window"), Headphones = args.Contains("--headphones") };
     }
 }
 
@@ -73,10 +74,15 @@ internal static class Program
         return BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
 
-    public static AppBuilder BuildAvaloniaApp() => AppBuilder
-        .Configure<App>()
-        .UsePlatformDetect()
-        .AfterPlatformServicesSetup(_ => RenderScheduling.Initialize(SettingsStore.Load()));
+    public static AppBuilder BuildAvaloniaApp()
+    {
+        var builder = AppBuilder.Configure<App>();
+        if (OperatingSystem.IsLinux())
+            builder.UseHarfBuzz().UseSkia().UseWayland();
+        else
+            builder.UsePlatformDetect();
+        return builder.AfterPlatformServicesSetup(_ => RenderScheduling.Initialize(SettingsStore.Load()));
+    }
 
     private static int WriteSnapshot(string path)
     {
@@ -102,9 +108,12 @@ public sealed class App : Application
     private readonly CancellationTokenSource _shutdown = new();
     private readonly SemaphoreSlim _playbackRestart = new(1, 1);
     private TrayIcon? _trayIcon;
-    private SettingsWindow? _settingsWindow;
+    private NativeMenuItem? _islandMenuItem;
+    private Action? _updateTrayPlayback;
+    private HeadphoneService? _headphones;
     private LyricsWindow? _lyricsWindow;
     private OverlayWindow? _overlay;
+    private WaylandAccessibility? _accessibility;
     private WindowIcon? _appIcon;
     private PlaybackStore? _store;
     private IPlaybackSource? _playbackSource;
@@ -132,12 +141,19 @@ public sealed class App : Application
             if (_settings.StartOnLogin)
                 Autostart.SetEnabled(true);
             _overlay = new OverlayWindow(
-                _store, _settings, SavePosition, UpdateTrackOffset, ShowSettings, ShowLyricsWindow,
+                _store, _settings, UpdateTrackOffset, ControlPlaybackAsync, ShowSettings, ShowLyricsWindow, ShowBanner,
                 () => desktop.Shutdown());
+            if (OperatingSystem.IsLinux())
+            {
+                _accessibility = new WaylandAccessibility();
+                _accessibility.Track(_overlay);
+                Dispatcher.UIThread.Post(async () => await _accessibility.StartAsync());
+            }
             desktop.MainWindow = _overlay;
-            _overlay.Screens.Changed += (_, _) => RenderScheduling.DisplayChanged();
             desktop.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            _headphones = new HeadphoneService();
             CreateTrayIcon(desktop);
+            _ = _headphones.InitializeAsync();
 
             if (Program.Options.Demo)
                 _ = DemoSource.RunAsync(_store, _shutdown.Token);
@@ -146,27 +162,170 @@ public sealed class App : Application
 
             if (Program.Options.LyricsWindow)
                 Dispatcher.UIThread.Post(ShowLyricsWindow);
+            if (Program.Options.Headphones)
+                Dispatcher.UIThread.Post(ShowHeadphones);
 
             if (Program.Options.ExitAfterSeconds is { } seconds)
                 _ = ExitLaterAsync(desktop, seconds, _shutdown.Token);
 
             // Avalonia 12.1.1's Linux D-Bus tray can throw while Dispose cancels its watcher.
             // Process exit releases the D-Bus registration, so keep the icon alive until then.
-            desktop.Exit += (_, _) => { _shutdown.Cancel(); RenderScheduling.Stop(); };
+            desktop.Exit += (_, _) =>
+            {
+                _shutdown.Cancel();
+                _headphones.Dispose();
+                _accessibility?.Stop();
+            };
         }
         base.OnFrameworkInitializationCompleted();
     }
 
     private void CreateTrayIcon(IClassicDesktopStyleApplicationLifetime desktop)
     {
+        var favorite = new NativeMenuItem("收藏歌曲") { IsEnabled = false };
+        var favoriteBusy = false;
+        void UpdateFavorite()
+        {
+            var snapshot = _store!.Snapshot;
+            favorite.IsVisible = !Program.Options.Demo && _settings.PlaybackSource == PlaybackSourcePreference.Spotify;
+            favorite.Header = snapshot.Controls.IsFavorite == true ? "取消收藏歌曲" : "收藏歌曲";
+            favorite.IsEnabled = !favoriteBusy && snapshot.Track is not null && snapshot.Controls.CanFavorite;
+        }
+        async Task ToggleFavoriteAsync()
+        {
+            var snapshot = _store!.Snapshot;
+            if (favoriteBusy || snapshot.Track is null || !snapshot.Controls.CanFavorite)
+                return;
+            favoriteBusy = true;
+            UpdateFavorite();
+            try
+            {
+                var error = await ControlPlaybackAsync(new PlaybackCommand(
+                    PlaybackAction.Favorite, snapshot.Controls.IsFavorite == true ? 0 : 1, snapshot.Track.Id),
+                    _shutdown.Token);
+                if (error is not null)
+                    Console.Error.WriteLine($"[favorite] {error}");
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"[favorite] {exception}");
+            }
+            finally
+            {
+                favoriteBusy = false;
+                UpdateFavorite();
+            }
+        }
+        favorite.Click += (_, _) => Dispatcher.UIThread.Post(async () => await ToggleFavoriteAsync());
         var lyrics = new NativeMenuItem("打开歌词窗口");
         lyrics.Click += (_, _) => Dispatcher.UIThread.Post(ShowLyricsWindow);
+        _islandMenuItem = new NativeMenuItem("显示词岛")
+        {
+            ToggleType = MenuItemToggleType.CheckBox,
+            IsChecked = _settings.ShowIsland
+        };
+        _islandMenuItem.Click += (_, _) => Dispatcher.UIThread.Post(() =>
+        {
+            if (!ApplySettings(_settings with { ShowIsland = !_settings.ShowIsland }, false))
+                _islandMenuItem.IsChecked = _settings.ShowIsland;
+        });
+        var headphones = new NativeMenuItem("耳机控制");
+        headphones.Click += (_, _) => Dispatcher.UIThread.Post(ShowHeadphones);
+        var noiseMenu = new NativeMenu();
+        var noise = new NativeMenuItem("降噪模式") { Menu = noiseMenu };
+        var noiseModes = new Dictionary<HeadphoneNoiseMode, NativeMenuItem>();
+        var noiseLevels = new Dictionary<HeadphoneNoiseLevel, NativeMenuItem>();
+        var levelMenu = new NativeMenu();
+        var levels = new NativeMenuItem("降噪强度") { Menu = levelMenu };
+        void UpdateHeadphones()
+        {
+            var state = _headphones!.State;
+            var available = state.IsConnected && !_headphones.IsBusy;
+            noise.IsEnabled = available && state.Capabilities.NoiseModes.Count != 0;
+            noise.Header = state.IsConnected ? "降噪模式" : "降噪模式（未连接）";
+            foreach (var (mode, item) in noiseModes)
+            {
+                item.IsVisible = state.Capabilities.NoiseModes.Contains(mode);
+                item.IsEnabled = available;
+                item.IsChecked = state.NoiseMode == mode;
+            }
+            levels.IsVisible = state.NoiseMode == HeadphoneNoiseMode.NoiseCancellation
+                && state.Capabilities.NoiseLevels.Count != 0;
+            levels.IsEnabled = available;
+            foreach (var (level, item) in noiseLevels)
+            {
+                item.IsVisible = state.Capabilities.NoiseLevels.Contains(level);
+                item.IsEnabled = available;
+                item.IsChecked = state.NoiseMode == HeadphoneNoiseMode.NoiseCancellation
+                    && state.NoiseLevel == level;
+            }
+        }
+        foreach (var (mode, label) in new[]
+        {
+            (HeadphoneNoiseMode.Off, "关闭"),
+            (HeadphoneNoiseMode.NoiseCancellation, "降噪"),
+            (HeadphoneNoiseMode.Transparency, "通透"),
+            (HeadphoneNoiseMode.Adaptive, "自适应")
+        })
+        {
+            var item = new NativeMenuItem(label) { ToggleType = MenuItemToggleType.Radio };
+            item.Click += (_, _) => Dispatcher.UIThread.Post(async () =>
+            {
+                UpdateHeadphones();
+                if (!_headphones!.State.IsConnected || _headphones.IsBusy) return;
+                await _headphones.SetNoiseModeAsync(mode);
+                UpdateHeadphones();
+            });
+            noiseModes.Add(mode, item);
+            noiseMenu.Add(item);
+        }
+        foreach (var (level, label) in new[]
+        {
+            (HeadphoneNoiseLevel.Smart, "智能"),
+            (HeadphoneNoiseLevel.Deep, "深度"),
+            (HeadphoneNoiseLevel.Moderate, "中度"),
+            (HeadphoneNoiseLevel.Light, "轻度")
+        })
+        {
+            var item = new NativeMenuItem(label) { ToggleType = MenuItemToggleType.Radio };
+            item.Click += (_, _) => Dispatcher.UIThread.Post(async () =>
+            {
+                UpdateHeadphones();
+                if (!_headphones!.State.IsConnected || _headphones.IsBusy) return;
+                await _headphones.SetNoiseLevelAsync(level);
+                UpdateHeadphones();
+            });
+            noiseLevels.Add(level, item);
+            levelMenu.Add(item);
+        }
+        noiseMenu.Add(levels);
         var settings = new NativeMenuItem("设置");
         settings.Click += (_, _) => Dispatcher.UIThread.Post(ShowSettings);
         var exit = new NativeMenuItem("退出");
         exit.Click += (_, _) => Dispatcher.UIThread.Post(() => desktop.Shutdown());
         var menu = new NativeMenu();
+        // Linux's D-Bus menu exporter does not raise NeedsUpdate when the menu opens.
+        // Push changes so enabled states and radio selections stay current on Linux too.
+        void PlaybackChanged(object? sender, EventArgs args) => Dispatcher.UIThread.Post(UpdateFavorite);
+        void HeadphonesChanged(object? sender, EventArgs args) => Dispatcher.UIThread.Post(UpdateHeadphones);
+        _store!.Changed += PlaybackChanged;
+        _updateTrayPlayback = UpdateFavorite;
+        _headphones!.StateChanged += HeadphonesChanged;
+        desktop.Exit += (_, _) =>
+        {
+            _store.Changed -= PlaybackChanged;
+            _updateTrayPlayback = null;
+            _headphones.StateChanged -= HeadphonesChanged;
+        };
+        UpdateFavorite();
+        UpdateHeadphones();
         menu.Add(lyrics);
+        menu.Add(favorite);
+        menu.Add(_islandMenuItem);
+        menu.Add(new NativeMenuItemSeparator());
+        menu.Add(headphones);
+        menu.Add(noise);
         menu.Add(settings);
         menu.Add(exit);
 
@@ -184,20 +343,29 @@ public sealed class App : Application
         _trayIcon.Clicked += (_, _) => Dispatcher.UIThread.Post(ShowLyricsWindow);
     }
 
-    private void ShowLyricsWindow()
+    private void ShowLyricsWindow() => OpenLyricsWindow(null);
+
+    private void OpenLyricsWindow(PanelKind? panel)
     {
         if (_lyricsWindow is not null)
         {
             if (_lyricsWindow.WindowState == WindowState.Minimized)
                 _lyricsWindow.WindowState = WindowState.Normal;
             _lyricsWindow.Activate();
-            return;
         }
-        _lyricsWindow = new LyricsWindow(_store!, _settings, _appIcon, ControlPlaybackAsync,
-            ShowSettings, value => ApplySettings(_settings with { ShowTranslation = value }, false),
-            value => ApplySettings(_settings with { ShowIsland = value }, false));
-        _lyricsWindow.Closed += (_, _) => _lyricsWindow = null;
-        _lyricsWindow.Show();
+        else
+        {
+            _lyricsWindow = new LyricsWindow(_store!, _settings, _appIcon, ControlPlaybackAsync,
+                () => new SettingsPage(_settings, ApplySettings, () => _settings, RefreshCurrentTrack),
+                () => new BannerPage(_store!, () => _settings),
+                value => ApplySettings(_settings with { ShowTranslation = value }, false),
+                value => ApplySettings(_settings with { ShowIsland = value }, false), _headphones!);
+            _accessibility?.Track(_lyricsWindow);
+            _lyricsWindow.Closed += (_, _) => _lyricsWindow = null;
+            _lyricsWindow.Show();
+        }
+        if (panel is { } kind)
+            _lyricsWindow.OpenPanel(kind);
     }
 
     private async Task<string?> ControlPlaybackAsync(PlaybackCommand command, CancellationToken cancellationToken)
@@ -221,31 +389,15 @@ public sealed class App : Application
         return await source.ControlAsync(command, linked.Token);
     }
 
-    private void ShowSettings()
-    {
-        if (_settingsWindow is not null)
-        {
-            if (_settingsWindow.WindowState == WindowState.Minimized)
-                _settingsWindow.WindowState = WindowState.Normal;
-            _settingsWindow.Activate();
-            return;
-        }
+    private void ShowHeadphones() => OpenLyricsWindow(PanelKind.Headphones);
 
-        _settingsWindow = new SettingsWindow(
-            _settings,
-            _appIcon!,
-            ApplySettings,
-            () => _settings,
-            RefreshCurrentTrack);
-        _settingsWindow.Closed += (_, _) => _settingsWindow = null;
-        _settingsWindow.Show();
-    }
+    private void ShowSettings() => OpenLyricsWindow(PanelKind.Settings);
+
+    private void ShowBanner() => OpenLyricsWindow(PanelKind.Banner);
 
     private bool ApplySettings(IslandSettings settings, bool restartPlayback)
     {
         var previous = _settings;
-        if (settings.RememberPosition && _settings.RememberPosition)
-            settings = settings with { WindowX = _settings.WindowX, WindowY = _settings.WindowY };
         settings = SettingsStore.Normalize(settings);
         var autostartChanged = settings.StartOnLogin != _settings.StartOnLogin;
         if (autostartChanged && !Autostart.SetEnabled(settings.StartOnLogin))
@@ -258,6 +410,9 @@ public sealed class App : Application
         }
 
         _settings = settings;
+        _updateTrayPlayback?.Invoke();
+        if (_islandMenuItem is not null)
+            _islandMenuItem.IsChecked = settings.ShowIsland;
         RenderScheduling.Apply(settings);
         _overlay?.ApplySettings(_settings);
         _lyricsWindow?.ApplySettings(_settings);
@@ -269,7 +424,7 @@ public sealed class App : Application
         }
         if ((restartPlayback || previous.PlaybackSource != _settings.PlaybackSource)
             && !Program.Options.Demo)
-            _ = RestartPlaybackAsync();
+            _ = RestartPlaybackAsync(requestHistoryPermission: restartPlayback);
         return true;
     }
 
@@ -281,16 +436,7 @@ public sealed class App : Application
             offsetMs == 0 ? _settings.RemoveTrackOffset(track.Id) : _settings.WithTrackOffset(track, offsetMs),
             restartPlayback: false);
 
-    private void SavePosition(PixelPoint position)
-    {
-        if (!_settings.RememberPosition)
-            return;
-        var updated = _settings with { WindowX = position.X, WindowY = position.Y };
-        if (SettingsStore.Save(updated))
-            _settings = updated;
-    }
-
-    private async Task RestartPlaybackAsync()
+    private async Task RestartPlaybackAsync(bool requestHistoryPermission = false)
     {
         await _playbackRestart.WaitAsync();
         try
@@ -336,7 +482,8 @@ public sealed class App : Application
                 _store,
                 _settings.SpotifyClientId,
                 _settings.SpotifyClientSecret,
-                _settings.LyricsSource));
+                _settings.LyricsSource,
+                requestHistoryPermission));
         }
         finally
         {
@@ -660,12 +807,6 @@ internal static class SelfCheck
         var pillBounds = hitTestRenderer.CalculatePillBounds(960, 116, hitTestFrame);
         Require(IslandRenderer.HitTest(pillBounds, new Point(480, 58)), "island hit test");
         Require(!IslandRenderer.HitTest(pillBounds, new Point(0, 0)), "transparent hit test");
-        Require(OverlayWindow.CenteredHorizontally(
-                new PixelPoint(0, 321), new PixelRect(100, 0, 1_000, 500), 400)
-            == new PixelPoint(400, 321), "horizontal-only centering");
-        Require(OverlayWindow.ClampPosition(
-                new PixelPoint(-500, 900), new PixelRect(100, 50, 1_000, 600), 400, 100)
-            == new PixelPoint(100, 550), "screen position clamping");
         var inputRows = NativeOverlay.CapsuleRows(new PixelRect(10, 20, 100, 40));
         Require(inputRows.Length == 40
                 && inputRows[0].X > 10

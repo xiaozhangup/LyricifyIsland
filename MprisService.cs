@@ -11,6 +11,7 @@ internal sealed class MprisService : IPlaybackSource
     private const string ServicePrefix = "org.mpris.MediaPlayer2.";
     private const string PlayerPath = "/org/mpris/MediaPlayer2";
     private const string PlayerInterface = "org.mpris.MediaPlayer2.Player";
+    private const string TrackListInterface = "org.mpris.MediaPlayer2.TrackList";
     private const string PropertiesInterface = "org.freedesktop.DBus.Properties";
     private const long PositionJitterToleranceMs = 1_000;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(750);
@@ -23,6 +24,8 @@ internal sealed class MprisService : IPlaybackSource
     private TrackInfo? _track;
     private TrackInfo? _loadingTrack;
     private CancellationTokenSource? _trackLoad;
+    private Task _foregroundLoad = Task.CompletedTask;
+    private readonly TrackPrefetcher _prefetcher = new();
     private string? _selectedService;
     private long _crossfadeOffsetMs;
     private int _lyricsSource;
@@ -136,9 +139,12 @@ internal sealed class MprisService : IPlaybackSource
             Volatile.Write(ref _loadingTrack, currentTrack);
             _store.Update(Snapshot(player, currentTrack, reportedAt));
             _trackLoad = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _ = CompleteTrackAsync(player.Track, currentTrack, _trackLoad.Token);
+            _foregroundLoad = CompleteTrackAsync(player.Track, currentTrack, _trackLoad.Token);
         }
 
+        _prefetcher.Update($"{player.Service}:{player.TrackPath}:{player.Track.Id}", player.Track.Id,
+            (LyricsSourcePreference)Volatile.Read(ref _lyricsSource), _foregroundLoad,
+            token => ReadNeighborsAsync(player, token), null, cancellationToken);
         currentTrack = Volatile.Read(ref _track)!;
         _store.Update(Snapshot(player, currentTrack, reportedAt));
     }
@@ -247,7 +253,8 @@ internal sealed class MprisService : IPlaybackSource
     {
         try
         {
-            var lyricsTask = LoadLyricsSafeAsync(source, cancellationToken);
+            var lyricsSource = (LyricsSourcePreference)Volatile.Read(ref _lyricsSource);
+            var lyricsTask = LoadLyricsSafeAsync(source, lyricsSource, cancellationToken);
             var albumTask = SpotifyService.LoadImageSafeAsync(source.AlbumArtUrl, cancellationToken);
             await Task.WhenAll(lyricsTask, albumTask);
             var lyrics = await lyricsTask;
@@ -259,7 +266,8 @@ internal sealed class MprisService : IPlaybackSource
                 Album = source.Album,
                 DurationMs = source.DurationMs,
                 AlbumArtBytes = TrackCache.PreferLargerImage(placeholder.AlbumArtBytes, album),
-                Lyrics = lyrics.IsEmpty ? placeholder.Lyrics : lyrics
+                Lyrics = lyrics.IsEmpty ? placeholder.Lyrics : lyrics,
+                LyricsSource = lyrics.IsEmpty ? placeholder.LyricsSource : lyricsSource
             };
             if (Interlocked.CompareExchange(ref _track, next, placeholder) == placeholder)
                 TrackCache.SaveIfChanged(next);
@@ -279,11 +287,11 @@ internal sealed class MprisService : IPlaybackSource
 
     private async Task<ImmutableArray<LyricLine>> LoadLyricsSafeAsync(
         SourceTrack track,
+        LyricsSourcePreference source,
         CancellationToken cancellationToken)
     {
         try
         {
-            var source = (LyricsSourcePreference)Volatile.Read(ref _lyricsSource);
             return await LyricsProvider.LoadAsync(track, source, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -363,7 +371,8 @@ internal sealed class MprisService : IPlaybackSource
         }
     }
 
-    private static Task<Dictionary<string, VariantValue>> GetPlayerPropertiesAsync(string service)
+    private static Task<Dictionary<string, VariantValue>> GetPlayerPropertiesAsync(
+        string service, string interfaceName = PlayerInterface)
     {
         var connection = DBusConnection.Session;
         using var writer = connection.GetMessageWriter();
@@ -373,10 +382,52 @@ internal sealed class MprisService : IPlaybackSource
             @interface: PropertiesInterface,
             member: "GetAll",
             signature: "s");
-        writer.WriteString(PlayerInterface);
+        writer.WriteString(interfaceName);
         return connection.CallMethodAsync(
             writer.CreateMessage(),
             static (reply, _) => reply.GetBodyReader().ReadDictionaryOfStringToVariantValue());
+    }
+
+    private static async Task<IReadOnlyList<SourceTrack>> ReadNeighborsAsync(Player player, CancellationToken cancellationToken)
+    {
+        var root = await GetPlayerPropertiesAsync(player.Service, "org.mpris.MediaPlayer2")
+            .WaitAsync(PlayerTimeout, cancellationToken);
+        if (Boolean(root, "HasTrackList") != true || player.TrackPath is null)
+            return [];
+        var properties = await GetPlayerPropertiesAsync(player.Service, TrackListInterface)
+            .WaitAsync(PlayerTimeout, cancellationToken);
+        if (!properties.TryGetValue("Tracks", out var value))
+            return [];
+        var paths = Unwrap(value).GetArray<Tmds.DBus.Protocol.ObjectPath>();
+        var index = Array.FindIndex(paths, path => path.ToString() == player.TrackPath);
+        if (index < 0)
+            return [];
+        var neighbors = paths.Skip(index + 1).Take(5)
+            .Concat(paths.Take(index).Reverse().Take(5)).ToArray();
+        if (neighbors.Length == 0)
+            return [];
+        return await GetTracksMetadataAsync(player.Service, neighbors).WaitAsync(PlayerTimeout, cancellationToken);
+    }
+
+    private static Task<IReadOnlyList<SourceTrack>> GetTracksMetadataAsync(
+        string service, Tmds.DBus.Protocol.ObjectPath[] paths)
+    {
+        var connection = DBusConnection.Session;
+        using var writer = connection.GetMessageWriter();
+        writer.WriteMethodCallHeader(destination: service, path: PlayerPath,
+            @interface: TrackListInterface, member: "GetTracksMetadata", signature: "ao");
+        writer.WriteArray(paths);
+        return connection.CallMethodAsync<IReadOnlyList<SourceTrack>>(
+            writer.CreateMessage(), (reply, _) =>
+            {
+                var reader = reply.GetBodyReader();
+                var array = reader.ReadArrayStart(DBusType.Array);
+                var tracks = new List<SourceTrack>();
+                while (reader.HasNext(array))
+                    if (ParseMetadata(service, reader.ReadDictionaryOfStringToVariantValue()) is { } track)
+                        tracks.Add(track);
+                return tracks;
+            });
     }
 
     internal static Player? ParsePlayer(
@@ -392,39 +443,15 @@ internal sealed class MprisService : IPlaybackSource
         if (metadataValue.Type != VariantValueType.Dictionary)
             return null;
         var metadata = metadataValue.GetDictionary<string, VariantValue>();
-        var title = String(metadata, "xesam:title")?.Trim();
-        if (string.IsNullOrEmpty(title))
+        var track = ParseMetadata(service, metadata);
+        if (track is null)
             return null;
-
-        var artists = Strings(metadata, "xesam:artist")
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim())
-            .ToImmutableArray();
-        var albumArtists = Strings(metadata, "xesam:albumArtist")
-            .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim())
-            .ToImmutableArray();
-        if (albumArtists.IsDefaultOrEmpty)
-            albumArtists = artists;
-        var album = String(metadata, "xesam:album")?.Trim() ?? string.Empty;
-        var durationMs = MicrosecondsToMilliseconds(Int64(metadata, "mpris:length"));
+        var durationMs = track.DurationMs;
+        var trackPath = ObjectPath(metadata, "mpris:trackid");
         var positionMs = MicrosecondsToMilliseconds(Int64(properties, "Position"));
         var playbackRate = Double(properties, "Rate");
         if (!double.IsFinite(playbackRate) || playbackRate <= 0)
             playbackRate = 1d;
-        var url = String(metadata, "xesam:url");
-        var trackPath = ObjectPath(metadata, "mpris:trackid");
-        var id = BuildTrackId(service, url, trackPath, title, artists, album, durationMs);
-        var track = new SourceTrack(
-            id,
-            title,
-            artists,
-            [],
-            albumArtists,
-            album,
-            durationMs,
-            null,
-            String(metadata, "mpris:artUrl"));
         var canControl = Boolean(properties, "CanControl") == true;
         return new Player(service, track, positionMs, playbackStatus, playbackRate)
         {
@@ -441,6 +468,39 @@ internal sealed class MprisService : IPlaybackSource
                 canControl && properties.ContainsKey("Volume")
                     ? Math.Clamp(Double(properties, "Volume"), 0, 1) : null)
         };
+    }
+
+    private static SourceTrack? ParseMetadata(string service, IReadOnlyDictionary<string, VariantValue> metadata)
+    {
+        var title = String(metadata, "xesam:title")?.Trim();
+        if (string.IsNullOrEmpty(title))
+            return null;
+
+        var artists = Strings(metadata, "xesam:artist")
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .ToImmutableArray();
+        var albumArtists = Strings(metadata, "xesam:albumArtist")
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .ToImmutableArray();
+        if (albumArtists.IsDefaultOrEmpty)
+            albumArtists = artists;
+        var album = String(metadata, "xesam:album")?.Trim() ?? string.Empty;
+        var durationMs = MicrosecondsToMilliseconds(Int64(metadata, "mpris:length"));
+        var url = String(metadata, "xesam:url");
+        var trackPath = ObjectPath(metadata, "mpris:trackid");
+        var id = BuildTrackId(service, url, trackPath, title, artists, album, durationMs);
+        return new SourceTrack(
+            id,
+            title,
+            artists,
+            [],
+            albumArtists,
+            album,
+            durationMs,
+            null,
+            String(metadata, "mpris:artUrl"));
     }
 
     internal static Player? SelectPlayer(IReadOnlyList<Player> players, string? selectedService) =>
@@ -533,6 +593,7 @@ internal sealed class MprisService : IPlaybackSource
 
     private void CancelTrackLoad()
     {
+        _prefetcher.Stop();
         var trackLoad = Interlocked.Exchange(ref _trackLoad, null);
         if (trackLoad is not null)
         {

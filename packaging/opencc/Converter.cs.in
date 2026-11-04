@@ -1,0 +1,48 @@
+using System.Runtime.InteropServices;
+
+namespace Lyricify.Lyrics.Helpers.General;
+
+internal static class OpenCcConverter
+{
+    private static readonly Lazy<IntPtr> Simplified = new(() => Open("t2s.json"));
+    private static readonly Lazy<IntPtr> Traditional = new(() => Open("s2t.json"));
+    private static readonly object Sync = new();
+
+    internal static string ToSimplified(string text) => Convert(Simplified, text);
+    internal static string ToTraditional(string text) => Convert(Traditional, text);
+
+    private static IntPtr Open(string config)
+    {
+        var converter = opencc_open(config);
+        if (converter == new IntPtr(-1))
+            throw new InvalidOperationException($"Could not load OpenCC configuration {config}.");
+        return converter;
+    }
+
+    private static string Convert(Lazy<IntPtr> converter, string text)
+    {
+        lock (Sync)
+        {
+            var result = opencc_convert(converter.Value, text);
+            if (result == IntPtr.Zero || result == new IntPtr(-1))
+                throw new InvalidOperationException("OpenCC conversion failed.");
+            try
+            {
+                return Marshal.PtrToStringUTF8(result)!;
+            }
+            finally
+            {
+                opencc_free(result);
+            }
+        }
+    }
+
+    [DllImport("liblyricify-opencc.so", EntryPoint = "lyricify_opencc_open")]
+    private static extern IntPtr opencc_open([MarshalAs(UnmanagedType.LPUTF8Str)] string config);
+
+    [DllImport("liblyricify-opencc.so", EntryPoint = "lyricify_opencc_convert")]
+    private static extern IntPtr opencc_convert(IntPtr converter, [MarshalAs(UnmanagedType.LPUTF8Str)] string text);
+
+    [DllImport("liblyricify-opencc.so", EntryPoint = "lyricify_opencc_free")]
+    private static extern void opencc_free(IntPtr text);
+}

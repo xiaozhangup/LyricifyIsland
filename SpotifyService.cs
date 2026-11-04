@@ -15,8 +15,9 @@ internal sealed class SpotifyService : IPlaybackSource
     private const string ControlScope = "user-modify-playback-state";
     private const string LibraryReadScope = "user-library-read";
     private const string LibraryModifyScope = "user-library-modify";
+    private const string HistoryScope = "user-read-recently-played";
     private const string Scope = "user-read-currently-playing user-read-playback-state " + ControlScope
-        + " " + LibraryReadScope + " " + LibraryModifyScope;
+        + " " + LibraryReadScope + " " + LibraryModifyScope + " " + HistoryScope;
     private const string CurrentlyPlayingUrl = "https://api.spotify.com/v1/me/player?additional_types=track";
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(750);
     private const long CrossfadeTransitionSlackMs = 1_500;
@@ -24,12 +25,17 @@ internal sealed class SpotifyService : IPlaybackSource
 
     private readonly PlaybackStore _store;
     private readonly Credentials _credentials;
+    private readonly bool _requestHistoryPermission;
     private readonly SemaphoreSlim _pollWake = new(0);
     private readonly SemaphoreSlim _playerGate = new(1, 1);
     private TokenState? _tokens;
     private TrackInfo? _track;
     private TrackInfo? _loadingTrack;
     private CancellationTokenSource? _trackLoad;
+    private Task _foregroundLoad = Task.CompletedTask;
+    private readonly TrackPrefetcher _prefetcher = new();
+    private readonly List<SourceTrack> _recentTracks = [];
+    private DateTimeOffset _prefetchRetryAt;
     private long _lastPlaybackStateTimestamp;
     private long _crossfadeOffsetMs;
     private int _positionSyncVersion;
@@ -45,11 +51,13 @@ internal sealed class SpotifyService : IPlaybackSource
         PlaybackStore store,
         string clientId,
         string clientSecret,
-        LyricsSourcePreference lyricsSource)
+        LyricsSourcePreference lyricsSource,
+        bool requestHistoryPermission = false)
     {
         _store = store;
         _credentials = new Credentials(clientId, clientSecret);
         _lyricsSource = (int)lyricsSource;
+        _requestHistoryPermission = requestHistoryPermission;
     }
 
     public void SetLyricsSource(LyricsSourcePreference source) =>
@@ -70,6 +78,8 @@ internal sealed class SpotifyService : IPlaybackSource
         {
             _tokens = await LoadTokenAsync(cancellationToken)
                 ?? await AuthorizeAsync(cancellationToken);
+            if (_requestHistoryPermission && !HasScope(HistoryScope))
+                _tokens = await AuthorizeAsync(cancellationToken);
             if (_tokens.ExpiresAt <= DateTimeOffset.UtcNow.AddSeconds(30))
                 _tokens = await RefreshOrAuthorizeAsync(cancellationToken);
         }
@@ -238,8 +248,20 @@ internal sealed class SpotifyService : IPlaybackSource
                         ? "正在获取歌词…"
                         : string.Join(", ", currentTrack.Artists)));
                 _trackLoad = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                _ = CompleteTrackAsync(spotifyTrack, currentTrack, _trackLoad.Token);
+                _foregroundLoad = CompleteTrackAsync(spotifyTrack, currentTrack, _trackLoad.Token);
             }
+
+            if (_recentTracks.FirstOrDefault()?.Id != spotifyTrack.Id)
+            {
+                _recentTracks.RemoveAll(track => track.Id == spotifyTrack.Id);
+                _recentTracks.Insert(0, spotifyTrack);
+                if (_recentTracks.Count > 6) _recentTracks.RemoveAt(6);
+            }
+            var recentTracks = _recentTracks.Skip(1).ToArray();
+            _prefetcher.Update(spotifyTrack.Id, spotifyTrack.Id,
+                (LyricsSourcePreference)Volatile.Read(ref _lyricsSource), _foregroundLoad,
+                token => ReadNeighborsAsync(spotifyTrack.Id, recentTracks, token),
+                (track, token) => LoadArtistImagesSafeAsync(track.ArtistIds, token), cancellationToken);
 
             currentTrack = Volatile.Read(ref _track)!;
             var status = currentTrack.Lyrics.IsDefaultOrEmpty
@@ -464,9 +486,10 @@ internal sealed class SpotifyService : IPlaybackSource
         CancellationToken cancellationToken)
     {
         var published = placeholder;
+        var lyricsSource = (LyricsSourcePreference)Volatile.Read(ref _lyricsSource);
         try
         {
-            var lyricsTask = LoadLyricsSafeAsync(spotifyTrack, cancellationToken);
+            var lyricsTask = LoadLyricsSafeAsync(spotifyTrack, lyricsSource, cancellationToken);
             var albumTask = LoadImageSafeAsync(spotifyTrack.AlbumArtUrl, cancellationToken);
             var artistsTask = placeholder.ArtistImageBytes.IsDefaultOrEmpty
                 ? LoadArtistImagesSafeAsync(spotifyTrack.ArtistIds, cancellationToken)
@@ -503,7 +526,8 @@ internal sealed class SpotifyService : IPlaybackSource
                 var didPublish = Publish(published with
                 {
                     AlbumArtBytes = TrackCache.PreferLargerImage(published.AlbumArtBytes, album),
-                    Lyrics = lyrics.IsEmpty ? published.Lyrics : lyrics
+                    Lyrics = lyrics.IsEmpty ? published.Lyrics : lyrics,
+                    LyricsSource = lyrics.IsEmpty ? published.LyricsSource : lyricsSource
                 });
                 Interlocked.CompareExchange(ref _loadingTrack, null, published);
                 if (loadedLyrics && didPublish)
@@ -662,10 +686,56 @@ internal sealed class SpotifyService : IPlaybackSource
 
     private void CancelTrackLoad()
     {
+        _prefetcher.Stop();
         Volatile.Write(ref _loadingTrack, null);
         _trackLoad?.Cancel();
         _trackLoad?.Dispose();
         _trackLoad = null;
+    }
+
+    private async Task<IReadOnlyList<SourceTrack>> ReadNeighborsAsync(
+        string currentId, SourceTrack[] recentTracks, CancellationToken cancellationToken)
+    {
+        var tracks = new List<SourceTrack>();
+        using (var queue = await ReadPrefetchResponseAsync("queue", cancellationToken))
+        {
+            if (queue is not null && queue.RootElement.TryGetProperty("queue", out var items)
+                && items.ValueKind == JsonValueKind.Array)
+                tracks.AddRange(items.EnumerateArray().Take(5)
+                    .Where(item => GetString(item, "type") == "track")
+                    .Select(ParseTrack).OfType<SourceTrack>());
+        }
+        var history = new List<SourceTrack>();
+        if (HasScope(HistoryScope))
+        {
+            using var recent = await ReadPrefetchResponseAsync("recently-played?limit=6", cancellationToken);
+            if (recent is not null && recent.RootElement.TryGetProperty("items", out var items)
+                && items.ValueKind == JsonValueKind.Array)
+                foreach (var item in items.EnumerateArray())
+                    if (item.TryGetProperty("track", out var track) && track.ValueKind == JsonValueKind.Object
+                        && ParseTrack(track) is { } parsed && parsed.Id != currentId)
+                        history.Add(parsed);
+        }
+        // Observed tracks cover fast skips that Spotify's recently-played endpoint may omit.
+        tracks.AddRange(recentTracks.Concat(history).DistinctBy(track => track.Id).Take(5));
+        return tracks;
+    }
+
+    private async Task<JsonDocument?> ReadPrefetchResponseAsync(string endpoint, CancellationToken cancellationToken)
+    {
+        if (DateTimeOffset.UtcNow < _prefetchRetryAt)
+            return null;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"https://api.spotify.com/v1/me/player/{endpoint}");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _tokens!.AccessToken);
+        using var response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+        if ((int)response.StatusCode == 429)
+            _prefetchRetryAt = DateTimeOffset.UtcNow + RetryAfter(response);
+        if (!response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.NoContent)
+            return null;
+        await using var body = await response.Content.ReadAsStreamAsync(timeout.Token);
+        return await JsonDocument.ParseAsync(body, cancellationToken: timeout.Token);
     }
 
     private async Task<HttpResponseMessage> SendCurrentTrackAsync(CancellationToken cancellationToken)
@@ -936,11 +1006,11 @@ internal sealed class SpotifyService : IPlaybackSource
 
     private async Task<ImmutableArray<LyricLine>> LoadLyricsSafeAsync(
         SourceTrack track,
+        LyricsSourcePreference source,
         CancellationToken cancellationToken)
     {
         try
         {
-            var source = (LyricsSourcePreference)Volatile.Read(ref _lyricsSource);
             return await LyricsProvider.LoadAsync(track, source, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

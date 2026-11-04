@@ -8,4 +8,3 @@ Icon=lyricify-island
 Terminal=false
 Categories=AudioVideo;Audio;
 StartupNotify=false
-StartupWMClass=LyricifyIsland

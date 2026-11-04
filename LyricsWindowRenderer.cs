@@ -7,10 +7,18 @@ namespace LyricifyIsland;
 internal enum LyricsWindowAction
 {
     None, Minimize, Maximize, Close, Pin, FullScreen, Translation, LyricsOnly, Settings,
-    Previous, PlayPause, Next, Shuffle, Repeat, Seek, Volume, Lyric, Follow, Island, Favorite
+    Previous, PlayPause, Next, Shuffle, Repeat, Seek, Volume, Lyric, Follow, Island, Favorite, Headphones,
+    HeadphoneNoiseOff, HeadphoneNoiseCancellation, HeadphoneTransparency
 }
 
 internal sealed record LyricsWindowHit(LyricsWindowAction Action, Rect Bounds, bool Enabled = true, int Line = -1);
+
+internal sealed record LyricsHeadphoneStatus(string Name, string BatterySummary, string Description)
+{
+    public IReadOnlyList<HeadphoneNoiseMode> NoiseModes { get; init; } = [];
+    public HeadphoneNoiseMode? NoiseMode { get; init; }
+    public bool Busy { get; init; }
+}
 
 internal sealed record LyricsWindowFrame(
     PlaybackSnapshot Snapshot, double PositionMs, double LyricsPositionMs, double Seconds,
@@ -20,6 +28,10 @@ internal sealed record LyricsWindowFrame(
     public double? VolumePreview { get; init; }
     public bool ShowIsland { get; init; } = true;
     public LyricsWindowAction? PressedAction { get; init; }
+    public LyricsHeadphoneStatus? Headphones { get; init; }
+    /// <summary>0 = lyrics page, 1 = a settings/headphone panel covers the player and lyrics.</summary>
+    public double PanelProgress { get; init; }
+    public PanelKind? ActivePanel { get; init; }
 }
 
 internal sealed record LyricsWindowLayout(Rect Surface, Rect Lyrics, Rect Cover, Rect Progress,
@@ -61,6 +73,10 @@ internal sealed class LyricsWindowRenderer : IDisposable
 {
     // Match the secondary player buttons, with about 8 px of space around the 20 px icon.
     private const float FavoriteButtonSize = 36;
+    private const float HeadphoneShortcutSize = 28;
+    private const float HeadphoneControlGap = 4;
+    private const float HeadphoneLeadingPadding = HeadphoneControlGap;
+    private const float HeadphoneTextInset = 10;
     private const float LyricHorizontalPadding = 20;
     private const double BackgroundTransitionSeconds = .85;
 
@@ -125,6 +141,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
     private float _lyricsOnlyWidth;
     private float _lyricsOnlyFont;
     private double _lyricsOnlyProgress;
+    private double _headphoneExpansion;
+    private double _headphoneNoiseExpansion;
     private bool _translation;
     private bool _reset = true;
     private int _active = -1;
@@ -203,10 +221,27 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 canvas.ClipRoundRect(clip, SKClipOperation.Intersect, true);
             }
             DrawBackground(canvas, rect, frame.Seconds);
+            var panel = Math.Clamp(frame.PanelProgress, 0, 1);
+            if (panel > 0)
+            {
+                // Dim the cover-derived backdrop so panel pages keep the same colours but stay legible.
+                using var scrim = Paint(new SKColor(6, 10, 16, (byte)Math.Round(150 * panel)));
+                canvas.DrawRect(rect, scrim);
+            }
             DrawHeader(canvas, width, frame);
-            DrawPlayer(canvas, layout, frame, dt);
-            DrawLyrics(canvas, layout, frame, dt);
-            DrawFavorite(canvas, layout, frame);
+            if (panel < .999)
+            {
+                if (panel > 0)
+                {
+                    using var fade = Paint(White((byte)Math.Round(255 * (1 - panel))));
+                    canvas.SaveLayer(rect, fade);
+                }
+                DrawPlayer(canvas, layout, frame, dt);
+                DrawLyrics(canvas, layout, frame, dt);
+                DrawFavorite(canvas, layout, frame);
+                if (panel > 0)
+                    canvas.Restore();
+            }
             if (frame.Toast is { Length: > 0 } toast)
             {
                 var toastWidth = Math.Min(width - 80, 660);
@@ -320,8 +355,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 small.Canvas.DrawBitmap(_cover, new SKRect(0, 0, 64, 64));
                 using var image = small.Snapshot();
                 using var pixels = SKBitmap.FromImage(image);
-                _colorA = Average(pixels, 0, 32);
-                _colorB = Average(pixels, 32, 64);
+                _colorA = LyricsTheme.Average(pixels, 0, 32);
+                _colorB = LyricsTheme.Average(pixels, 32, 64);
                 using var blurred = SKSurface.Create(new SKImageInfo(64, 64));
                 using var blur = Paint(SKColors.White);
                 using var blurFilter = SKImageFilter.CreateBlur(10, 10, SKShaderTileMode.Clamp);
@@ -361,18 +396,6 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 ? new LyricsTextLayout(line.Translation, font * .53f, width - LyricHorizontalPadding * 2, _fonts, false) : null;
             return new RowLayout(text, translated, rowTop);
         }
-    }
-
-    private static SKColor Average(SKBitmap bitmap, int from, int to)
-    {
-        long r = 0, g = 0, b = 0, n = 0;
-        for (var y = from; y < to; y += 4)
-            for (var x = 0; x < 64; x += 4)
-            {
-                var color = bitmap.GetPixel(x, y);
-                r += color.Red; g += color.Green; b += color.Blue; n++;
-            }
-        return new SKColor((byte)(r / n), (byte)(g / n), (byte)(b / n));
     }
 
     private void DrawBackground(SKCanvas canvas, SKRect rect, double seconds)
@@ -418,18 +441,24 @@ internal sealed class LyricsWindowRenderer : IDisposable
 
     private void DrawHeader(SKCanvas canvas, float width, LyricsWindowFrame frame)
     {
-        Label(canvas, "Lyricify", 36, 27, 14, White(165), 160, true);
         var x = width - 42;
         HeaderButton(LyricsWindowAction.Close, "close", "关闭", false);
         HeaderButton(LyricsWindowAction.Maximize, frame.Maximized ? "restore" : "maximize", "最大化", false);
         HeaderButton(LyricsWindowAction.Minimize, "minimize", "最小化", false);
         x -= 16;
         HeaderButton(LyricsWindowAction.FullScreen, "fullscreen", "全屏", frame.FullScreen);
-        HeaderButton(LyricsWindowAction.Pin, "pin", "置顶", frame.Pinned);
+        if (!OperatingSystem.IsLinux())
+            HeaderButton(LyricsWindowAction.Pin, "pin", "置顶", frame.Pinned);
         HeaderButton(LyricsWindowAction.LyricsOnly, "lyrics", "纯歌词", frame.LyricsOnly);
         HeaderButton(LyricsWindowAction.Translation, "translation", "翻译", frame.ShowTranslation);
         HeaderButton(LyricsWindowAction.Island, "island", frame.ShowIsland ? "隐藏歌词灵动岛" : "显示歌词灵动岛", frame.ShowIsland);
-        HeaderButton(LyricsWindowAction.Settings, "settings", "设置", false);
+        HeaderButton(LyricsWindowAction.Settings, "settings", "设置", frame.ActivePanel is not null);
+        var brandOpacity = 1d;
+        if (frame.Headphones is { } headphones)
+            brandOpacity = DrawHeadphoneButton(canvas, frame, headphones, x);
+        else
+            _headphoneExpansion = _headphoneNoiseExpansion = 0;
+        Label(canvas, "Lyricify", 36, 27, 14, White((byte)(165 * brandOpacity)), 160, true);
         return;
 
         void HeaderButton(LyricsWindowAction action, string icon, string label, bool active)
@@ -447,6 +476,107 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 CenteredLabel(canvas, label, tooltip, 11, White((byte)(210 * tooltipOpacity)));
             }
             x -= 38;
+        }
+    }
+
+    private double DrawHeadphoneButton(SKCanvas canvas, LyricsWindowFrame frame, LyricsHeadphoneStatus headphones, float x)
+    {
+        // The icon occupies one fixed header slot; its details unfold into the free space on the left.
+        var right = x + 16;
+        var available = right - 36;
+        var nameWidth = GetLabel(headphones.Name, 11, available - 40, true).InkBounds.Width;
+        var batteryWidth = GetLabel(headphones.BatterySummary, 9.5f, available - 40).InkBounds.Width;
+        var expandedWidth = Math.Min(available, Math.Clamp(Math.Max(nameWidth, batteryWidth) + 40, 104, 300));
+        const float shortcutWidth = HeadphoneLeadingPadding + 3 * HeadphoneShortcutSize
+            + 3 * HeadphoneControlGap - HeadphoneTextInset;
+        var noiseWidth = Math.Min(available, expandedWidth + shortcutWidth);
+        var noiseDetailsWidth = noiseWidth - shortcutWidth;
+        var previousDetailWidth = Mix(32, expandedWidth, _headphoneExpansion);
+        var previousWidth = Mix(previousDetailWidth, noiseWidth, _headphoneNoiseExpansion);
+        var previousBounds = new Rect(right - previousWidth, 22, previousWidth, 30);
+        var noiseTarget = new Rect(right - noiseWidth, 22, noiseWidth, 30);
+        var overNoiseGroup = _headphoneNoiseExpansion > .001 && noiseTarget.Contains(frame.Pointer);
+        var trigger = new Rect(right - expandedWidth, 22, Math.Min(64, expandedWidth - 36), 30);
+        // Keep this boundary fixed while the shortcuts retract, so it cannot sweep over a stationary pointer.
+        var shortcutsRight = Math.Max(trigger.Right,
+            right - noiseDetailsWidth + HeadphoneTextInset - HeadphoneControlGap);
+        var shortcutArea = new Rect(right - noiseWidth, 22, shortcutsRight - (right - noiseWidth), 30);
+        var noiseTrigger = _headphoneExpansion > .9 && trigger.Contains(frame.Pointer);
+        var overShortcuts = _headphoneNoiseExpansion > .001 && shortcutArea.Contains(frame.Pointer);
+        var hovered = previousBounds.Contains(frame.Pointer) || overNoiseGroup;
+        _headphoneNoiseExpansion = Approach(_headphoneNoiseExpansion, noiseTrigger || overShortcuts ? 1 : 0, _frameDelta, 12);
+        if (_headphoneNoiseExpansion < .001) _headphoneNoiseExpansion = 0;
+        else if (_headphoneNoiseExpansion > .999) _headphoneNoiseExpansion = 1;
+        _headphoneExpansion = Approach(_headphoneExpansion, hovered ? 1 : 0, _frameDelta, 12);
+        if (_headphoneExpansion < .001) _headphoneExpansion = 0;
+        else if (_headphoneExpansion > .999) _headphoneExpansion = 1;
+        var primaryWidth = Mix(32, expandedWidth, _headphoneExpansion);
+        var buttonWidth = (float)Mix(primaryWidth, noiseWidth, _headphoneNoiseExpansion);
+        var detailsWidth = (float)Mix(primaryWidth, noiseDetailsWidth, _headphoneNoiseExpansion);
+        var bounds = new Rect(right - buttonWidth, 22, buttonWidth, 30);
+        var detailsLeft = right - detailsWidth;
+        var textLeft = detailsLeft + HeadphoneTextInset;
+        var motion = AnimateControl(LyricsWindowAction.Headphones, bounds, frame, true);
+        var backgroundAlpha = 22 * _headphoneExpansion + 16 * motion.Hover + 20 * motion.Pressed;
+        if (backgroundAlpha > .5)
+        {
+            using var background = Paint(White((byte)backgroundAlpha));
+            var radius = 9 + 3 * (float)_headphoneExpansion;
+            canvas.DrawRoundRect(ToSk(bounds), radius, radius, background);
+        }
+        Icon(canvas, "headphones", x, 37, 15, White((byte)(185 + 60 * motion.Hover)));
+        if (detailsWidth > 44)
+        {
+            var textWidth = (float)Mix(expandedWidth, noiseDetailsWidth, _headphoneNoiseExpansion) - 40;
+            var detailWidth = GetLabel(headphones.Description, 9.5f, 1000).InkBounds.Width;
+            var batteryText = detailWidth <= textWidth ? headphones.Description : headphones.BatterySummary;
+            var textOpacity = _headphoneExpansion;
+            canvas.Save();
+            canvas.ClipRect(new SKRect(detailsLeft + 9, 22, x - 12, 52));
+            Label(canvas, headphones.Name, textLeft, 24, 11,
+                White((byte)(220 * textOpacity)), textWidth, true);
+            Label(canvas, batteryText, textLeft, 38, 9.5f,
+                White((byte)(180 * textOpacity)), textWidth);
+            canvas.Restore();
+        }
+        if (_headphoneNoiseExpansion > 0)
+            DrawHeadphoneNoiseButtons(canvas, frame, headphones,
+                new Rect(bounds.Left, 22, textLeft - HeadphoneControlGap - bounds.Left, 30));
+        // Fade the brand before the expanding details reach it on narrow windows.
+        return Math.Clamp((bounds.Left - 88) / 28, 0, 1);
+    }
+
+    private void DrawHeadphoneNoiseButtons(SKCanvas canvas, LyricsWindowFrame frame, LyricsHeadphoneStatus headphones,
+        Rect revealed)
+    {
+        (string Text, double Center, double Opacity)? hint = null;
+        canvas.Save();
+        canvas.ClipRect(ToSk(revealed));
+        NoiseButton(0, LyricsWindowAction.HeadphoneNoiseOff, HeadphoneNoiseMode.Off, "noiseOff", "关闭降噪");
+        NoiseButton(1, LyricsWindowAction.HeadphoneNoiseCancellation, HeadphoneNoiseMode.NoiseCancellation, "noiseCancellation", "降噪");
+        NoiseButton(2, LyricsWindowAction.HeadphoneTransparency, HeadphoneNoiseMode.Transparency, "transparency", "通透");
+        canvas.Restore();
+        if (hint is { } label)
+            CenteredLabel(canvas, label.Text, new SKRect((float)label.Center - 36, 53, (float)label.Center + 36, 71),
+                10, White((byte)(180 * label.Opacity * _headphoneNoiseExpansion)));
+        return;
+
+        void NoiseButton(int index, LyricsWindowAction action, HeadphoneNoiseMode mode, string icon, string title)
+        {
+            var bounds = new Rect(revealed.Left + HeadphoneLeadingPadding
+                + index * (HeadphoneShortcutSize + HeadphoneControlGap), 24, HeadphoneShortcutSize, 26);
+            var enabled = !headphones.Busy && headphones.NoiseModes.Contains(mode) && _headphoneNoiseExpansion > .9;
+            var motion = AnimateControl(action, bounds.Intersect(revealed), frame, enabled, headphones.NoiseMode == mode);
+            using var selected = Paint((_cover is null ? new SKColor(137, 212, 162) : LyricsTheme.CoverAccent(_colorA, _colorB)).WithAlpha(
+                (byte)(32 * motion.Active * (.35 + .65 * motion.Enabled) * _headphoneNoiseExpansion)));
+            canvas.DrawRoundRect(ToSk(bounds), 8, 8, selected);
+            using var hover = Paint(White((byte)((12 * motion.Hover + 16 * motion.Pressed) * _headphoneNoiseExpansion)));
+            canvas.DrawRoundRect(ToSk(bounds), 8, 8, hover);
+            var iconAlpha = Mix(65, 190 + 45 * Math.Max(motion.Active, motion.Hover), motion.Enabled);
+            Icon(canvas, icon, (float)bounds.Center.X, (float)bounds.Center.Y, 17,
+                White((byte)(iconAlpha * _headphoneNoiseExpansion)));
+            if (motion.Hover > .01 && (hint is null || motion.Hover > hint.Value.Opacity))
+                hint = (title, bounds.Center.X, motion.Hover);
         }
     }
 
@@ -1062,6 +1192,35 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 break;
             case "pin": Path((-5, -9), (5, -9), (4, -2), (8, 3), (-8, 3), (-4, -2), (-5, -9)); Line(0, 3, 0, 10); break;
             case "lyrics": Line(-8, -7, 8, -7); Line(-8, 0, 8, 0); Line(-8, 7, 3, 7); break;
+            case "headphones":
+                path.AddArc(new SKRect(-8, -9, 8, 9), 180, 180);
+                canvas.DrawPath(path, paint);
+                canvas.DrawRoundRect(new SKRect(-9, -1, -5, 8), 2, 2, paint);
+                canvas.DrawRoundRect(new SKRect(5, -1, 9, 8), 2, 2, paint);
+                break;
+            case "noiseOff":
+                path.AddArc(new SKRect(-8, -8, 8, 8), -45, 270);
+                canvas.DrawPath(path, paint);
+                Line(0, -10, 0, -1);
+                break;
+            case "noiseCancellation":
+                Line(-8, -3, -8, 3); Line(-4, -7, -4, 0);
+                Line(0, -9, 0, -4); Line(0, 4, 0, 9);
+                Line(4, 0, 4, 7); Line(8, -3, 8, 3);
+                Line(-9, 9, 9, -9);
+                break;
+            case "transparency":
+                path.MoveTo(-6, -3);
+                path.CubicTo(-6, -12, 8, -12, 8, -3);
+                path.CubicTo(8, 2, 3, 3, 2, 7);
+                path.CubicTo(1, 11, -5, 10, -5, 6);
+                canvas.DrawPath(path, paint);
+                path.Reset();
+                path.MoveTo(-2, -2);
+                path.CubicTo(-2, -7, 4, -7, 4, -2);
+                path.LineTo(0, 2);
+                canvas.DrawPath(path, paint);
+                break;
             case "island": canvas.DrawRoundRect(new SKRect(-11, -5, 11, 5), 5, 5, paint); Line(-5, 0, 5, 0); break;
             case "translation":
                 paint.Style = SKPaintStyle.Fill;

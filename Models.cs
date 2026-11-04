@@ -22,6 +22,7 @@ public sealed record TrackInfo(
 {
     public ImmutableArray<ImmutableArray<byte>> ArtistImageBytes { get; init; } = [];
     public string? AlbumArtUrl { get; init; }
+    public LyricsSourcePreference? LyricsSource { get; init; }
 }
 
 public sealed record PlaybackSnapshot(
@@ -98,5 +99,11 @@ public sealed class PlaybackStore
 
     public PlaybackSnapshot Snapshot => Volatile.Read(ref _snapshot);
 
-    public void Update(PlaybackSnapshot snapshot) => Volatile.Write(ref _snapshot, snapshot);
+    public event EventHandler? Changed;
+
+    public void Update(PlaybackSnapshot snapshot)
+    {
+        Volatile.Write(ref _snapshot, snapshot);
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
 }
