@@ -154,6 +154,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
     private double _scrollTarget;
     private double _maxScroll;
     private double _coverScale = 1;
+    private bool _controlsAnimating;
+    private bool _isAnimating = true;
     private SKColor _colorA = new(57, 80, 102);
     private SKColor _colorB = new(76, 51, 75);
     private int _references = 1;
@@ -161,6 +163,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
     public double ScrollTarget => Volatile.Read(ref _scrollTarget);
     public double MaxScroll => Volatile.Read(ref _maxScroll);
     public LyricsWindowLayout? Layout => Volatile.Read(ref _publishedLayout);
+    public bool IsAnimating => Volatile.Read(ref _isAnimating);
+    public void MarkDirty() => Volatile.Write(ref _isAnimating, true);
     public LyricsWindowHit? HitTest(Point point) => Volatile.Read(ref _publishedHits)
         .LastOrDefault(hit => hit.Bounds.Contains(point));
 
@@ -194,6 +198,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
             var dt = _lastSeconds == 0 ? 1d / 60 : Math.Clamp(frame.Seconds - _lastSeconds, 0, .05);
             _frameDelta = dt;
             _lastSeconds = frame.Seconds;
+            _controlsAnimating = false;
             var fillWindow = frame.FullScreen || frame.Maximized;
             var normal = LyricsWindowLayout.Create(width, height, false, fillWindow);
             var lyricsOnly = LyricsWindowLayout.Create(width, height, true, fillWindow);
@@ -259,6 +264,23 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 canvas.DrawRoundRect(rect, 24, 24, rim);
             }
             canvas.Restore();
+            var animating = _controlsAnimating
+                || _previousBackground is not null
+                || InTransition(_lyricsOnlyProgress)
+                || InTransition(panel)
+                || InTransition(_headphoneExpansion)
+                || InTransition(_headphoneNoiseExpansion);
+            if (!animating && panel < .999)
+            {
+                var targetCoverScale = frame.Snapshot.IsPlaying ? 1d : .95d;
+                animating = Math.Abs(_coverScale - targetCoverScale) > .001
+                    || InTransition(_followOpacity)
+                    || InTransition(_followHover)
+                    || _rows.Count > 0 && frame.Seconds - _changedAt < 2
+                    || _rows.Any(row => InTransition(row.Hover) || InTransition(row.Emphasis)
+                        || Math.Abs(row.Velocity) > .05 || Math.Abs(row.Y - row.Target) > .1);
+            }
+            Volatile.Write(ref _isAnimating, animating);
             Volatile.Write(ref _publishedHits, _hits.ToArray());
             Volatile.Write(ref _publishedLayout, layout with
             {
@@ -593,7 +615,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
             if (metadataOpacity < 1) canvas.SaveLayer(opacity);
             else canvas.Save();
             canvas.Translate((float)offset.X, (float)offset.Y);
-            _coverScale += ((frame.Snapshot.IsPlaying ? 1 : .95) - _coverScale) * (1 - Math.Exp(-dt * 7));
+            _coverScale = Approach(_coverScale, frame.Snapshot.IsPlaying ? 1 : .95, dt, 7);
             canvas.Save();
             canvas.Translate(cover.MidX, cover.MidY);
             canvas.Scale((float)_coverScale);
@@ -773,7 +795,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
             }
             if (frame.Seconds - _changedAt >= delay || frame.BrowseScroll.HasValue) row.Target = target;
             Spring(row, dt);
-            row.Emphasis += ((i == index ? 1 : 0) - row.Emphasis) * (1 - Math.Exp(-dt * 8));
+            row.Emphasis = Approach(row.Emphasis, i == index ? 1 : 0, dt, 8);
             if (row.Y + rowHeight < viewport.Top - 50 || row.Y > viewport.Bottom + 50)
             {
                 row.IdleImage?.Dispose();
@@ -943,10 +965,20 @@ internal sealed class LyricsWindowRenderer : IDisposable
             row.Velocity += ((row.Target - row.Y) * 145 - row.Velocity * 22) * step;
             row.Y += row.Velocity * step;
         }
+        if (Math.Abs(row.Y - row.Target) < .05 && Math.Abs(row.Velocity) < .05)
+        {
+            row.Y = row.Target;
+            row.Velocity = 0;
+        }
     }
 
-    private static double Approach(double value, double target, double dt, double speed = 16) =>
-        value + (target - value) * (1 - Math.Exp(-dt * speed));
+    private static bool InTransition(double value) => value is > .001 and < .999;
+
+    private static double Approach(double value, double target, double dt, double speed = 16)
+    {
+        var next = value + (target - value) * (1 - Math.Exp(-dt * speed));
+        return Math.Abs(next - target) < .0005 ? target : next;
+    }
 
     private static double Mix(double from, double to, double progress) => from + (to - from) * progress;
     private static Rect Mix(Rect from, Rect to, double progress) => new(
@@ -958,7 +990,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
     {
         if (progress == 1) { text = expanded; progress = 0; }
         var scale = (float)Mix(1, expanded.FontSize / text.FontSize, progress);
-        for (var i = 0; i < text.Glyphs.Count; i++)
+        var count = Math.Min(text.Glyphs.Count, expanded.Glyphs.Count);
+        for (var i = 0; i < count; i++)
         {
             var glyph = text.Glyphs[i];
             var target = expanded.Glyphs[i];
@@ -970,6 +1003,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
         }
     }
 
+    private static readonly SKMaskFilter LyricGlowFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 2.5f);
+
     private static void DrawLyricText(SKCanvas canvas, LyricsTextLayout text, LyricsTextLayout expanded,
         double layoutProgress, double position, double emphasis, double browseEmphasis)
     {
@@ -979,9 +1014,9 @@ internal sealed class LyricsWindowRenderer : IDisposable
         using var idle = Paint(White((byte)(idleOpacity + (155 - idleOpacity) * browseEmphasis)));
         using var bright = Paint(White((byte)(230 * emphasis)));
         using var glow = Paint(White((byte)(60 * emphasis)));
-        using var glowFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, 2.5f);
-        glow.MaskFilter = glowFilter;
-        for (var i = 0; i < text.Glyphs.Count; i++)
+        glow.MaskFilter = LyricGlowFilter;
+        var count = Math.Min(text.Glyphs.Count, expanded.Glyphs.Count);
+        for (var i = 0; i < count; i++)
         {
             var glyph = text.Glyphs[i];
             var target = expanded.Glyphs[i];
@@ -1023,6 +1058,10 @@ internal sealed class LyricsWindowRenderer : IDisposable
         motion.Hover = Approach(motion.Hover, hovered && enabled ? 1 : 0, _frameDelta);
         motion.Active = Approach(motion.Active, active ? 1 : 0, _frameDelta);
         motion.Pressed = Approach(motion.Pressed, frame.PressedAction == action && hovered && enabled ? 1 : 0, _frameDelta);
+        _controlsAnimating |= InTransition(motion.Enabled)
+            || InTransition(motion.Hover)
+            || InTransition(motion.Active)
+            || InTransition(motion.Pressed);
         return motion;
     }
 

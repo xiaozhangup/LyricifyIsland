@@ -17,13 +17,16 @@ internal sealed partial class HeadphoneService : IDisposable
     private readonly Channel<BluetoothChange> _bluetoothChanges = Channel.CreateUnbounded<BluetoothChange>(
         new UnboundedChannelOptions { SingleReader = true });
     private readonly List<IDisposable> _bluetoothObservers = [];
-    private readonly HashSet<string> _attemptedConnections = [];
+    private readonly HashSet<string> _suppressedConnections = [];
+    private readonly Dictionary<string, int> _autoConnectFailures = [];
+    private readonly HashSet<string> _resolvedDevices = [];
     private readonly string _settingsPath = Path.Combine(SettingsStore.ConfigHome(), "lyricify-island", "headphones.json");
     private HeadphoneState _state = new();
     private HeadphoneProfile? _profile;
     private Session? _session;
     private Preferences _preferences = new();
     private CancellationTokenSource? _deviceCancellation;
+    private CancellationTokenSource? _retryCancellation;
     private string? _devicePath;
     private Task _bluetoothMonitor = Task.CompletedTask;
     private bool _disposed;
@@ -49,15 +52,33 @@ internal sealed partial class HeadphoneService : IDisposable
         }, "读取耳机设置失败");
     }
 
-    public Task RefreshDevicesAsync() => PerformAsync(RefreshDevicesCoreAsync, "查找耳机失败");
+    public Task RefreshDevicesAsync() => PerformAsync(async () =>
+    {
+        _autoConnectFailures.Clear();
+        await RefreshDevicesCoreAsync();
+        if (AutoConnect && _session is null)
+            _bluetoothChanges.Writer.TryWrite(new BluetoothChange());
+    }, "查找耳机失败");
 
     private async Task RefreshDevicesCoreAsync()
     {
         Devices = await ReadDevicesAsync().WaitAsync(TimeSpan.FromSeconds(5), _lifetime.Token);
-        var address = SelectedDevice?.Address ?? _preferences.Address;
-        var selected = Devices.FirstOrDefault(device => device.Address == address) ?? Devices.FirstOrDefault();
+        var current = Devices.FirstOrDefault(device => device.Address == SelectedDevice?.Address);
+        var preferred = Devices.FirstOrDefault(device => device.Address == _preferences.Address);
+        HeadphoneDevice? selected;
+        if (_session is not null)
+            selected = current ?? preferred ?? Devices.FirstOrDefault();
+        else if (current is { IsConnected: true })
+            selected = current;
+        else if (preferred is { IsConnected: true })
+            selected = preferred;
+        else
+            selected = Devices.FirstOrDefault(device => device.IsConnected) ?? current ?? preferred ?? Devices.FirstOrDefault();
+
         if (_session is null && (selected?.Address != SelectedDevice?.Address ||
-            selected?.Name != SelectedDevice?.Name || selected?.HasHuaweiSerialService != SelectedDevice?.HasHuaweiSerialService))
+            selected?.Name != SelectedDevice?.Name || selected?.Alias != SelectedDevice?.Alias ||
+            selected?.HasHuaweiSerialService != SelectedDevice?.HasHuaweiSerialService ||
+            selected?.HasOppoService != SelectedDevice?.HasOppoService))
             ApplySelection(selected);
         else if (selected?.Address == SelectedDevice?.Address)
             SelectedDevice = selected;
@@ -75,6 +96,8 @@ internal sealed partial class HeadphoneService : IDisposable
         ApplySelection(device);
         _preferences.Address = device.Address;
         SavePreferences();
+        _suppressedConnections.Remove(device.ObjectPath);
+        _autoConnectFailures.Remove(device.ObjectPath);
         _bluetoothChanges.Writer.TryWrite(new BluetoothChange());
     });
 
@@ -90,7 +113,16 @@ internal sealed partial class HeadphoneService : IDisposable
         StatusMessage = device is null ? "选择已配对的耳机" : "未连接 · 打开耳机盒或戴上耳机后连接";
     }
 
-    public Task ConnectAsync() => PerformAsync(ConnectCoreAsync, "连接失败");
+    public Task ConnectAsync() => PerformAsync(async () =>
+    {
+        if (SelectedDevice is { } device)
+        {
+            _suppressedConnections.Remove(device.ObjectPath);
+            _autoConnectFailures.Remove(device.ObjectPath);
+        }
+        CancelRetry();
+        await ConnectCoreAsync();
+    }, "连接失败");
 
     private async Task ConnectCoreAsync()
     {
@@ -98,7 +130,6 @@ internal sealed partial class HeadphoneService : IDisposable
         var device = SelectedDevice ?? throw new InvalidOperationException("请先选择耳机");
         if (!State.Capabilities.SupportsRfcomm)
             throw new InvalidOperationException("该型号不提供 RFCOMM 控制服务");
-        _attemptedConnections.Add(device.ObjectPath);
         await DisconnectCoreAsync();
         StatusMessage = "正在连接耳机…";
         Publish();
@@ -110,37 +141,29 @@ internal sealed partial class HeadphoneService : IDisposable
         }
         try
         {
-            var transport = await HeadphoneTransport.ConnectAsync(device.Address, ConnectionMethod, _profile?.ServiceUuid, cancellation.Token);
-            var session = new Session(transport, cancellation, _profile?.Huawei is not null);
+            var isHuawei = _profile?.Huawei is not null;
+            var canFallbackToOppo = isHuawei && ReferenceEquals(_profile, HuaweiHeadphoneCatalog.Unknown) &&
+                string.IsNullOrEmpty(HuaweiModelOverride);
+            var transport = await HeadphoneTransport.ConnectAsync(
+                device.Address, ConnectionMethod, _profile?.ServiceUuid, isHuawei, cancellation.Token);
+            var session = new Session(transport, cancellation, isHuawei);
             _session = session;
             session.Reader = ReadLoopAsync(session);
             if (session.IsHuawei)
             {
-                await InitializeHuaweiAsync(session);
-                session.Poller = PollLoopAsync(session);
-                return;
+                try
+                {
+                    await InitializeHuaweiAsync(session);
+                    session.Poller = PollLoopAsync(session);
+                    return;
+                }
+                catch (TimeoutException) when (canFallbackToOppo && !cancellation.IsCancellationRequested)
+                {
+                    // A renamed OPPO/OnePlus model using standard SPP (0x1101) can initially appear as Unknown Huawei.
+                    session.IsHuawei = false;
+                }
             }
-            // Some firmwares require the product request to be the first application packet.
-            var identity = await RequestAsync(session, 0x0103, []);
-            RequireSuccess(identity);
-            if (identity.Length != 4) throw new IOException("耳机未返回有效的产品标识");
-            await OptionalQueryAsync(session, 0x0100, []);
-            Update(state => state with { IsConnected = true });
-            StatusMessage = $"已连接 · {State.ModelName ?? device.Name}";
-            _preferences.Address = device.Address;
-            SavePreferences();
-            var notifications = await OptionalQueryAsync(session, 0x0200, []);
-            if (notifications is { Length: >= 2 } && notifications[0] == 0 &&
-                notifications.Length >= 2 + notifications[1])
-            {
-                var codes = notifications.AsSpan(2, notifications[1]).ToArray();
-                if (session.BatchNotifications)
-                    await OptionalQueryAsync(session, 0x0205, [(byte)codes.Length, ..codes]);
-                else
-                    foreach (var code in codes.Intersect(new byte[] { 1, 2, 3, 6 }))
-                        await OptionalQueryAsync(session, 0x0201, [code]);
-            }
-            await RefreshCoreAsync(session);
+            await InitializeOppoAsync(session, device);
             session.Poller = PollLoopAsync(session);
         }
         catch
@@ -151,9 +174,44 @@ internal sealed partial class HeadphoneService : IDisposable
         }
     }
 
+    private async Task InitializeOppoAsync(Session session, HeadphoneDevice device)
+    {
+        // Some firmwares require the product request to be the first application packet.
+        byte[] identity;
+        try
+        {
+            identity = await RequestAsync(session, 0x0103, []);
+        }
+        catch (TimeoutException) when (!session.Cancellation.IsCancellationRequested)
+        {
+            await Task.Delay(250, session.Cancellation.Token);
+            identity = await RequestAsync(session, 0x0103, []);
+        }
+        RequireSuccess(identity);
+        if (identity.Length != 4) throw new IOException("耳机未返回有效的产品标识");
+        await OptionalQueryAsync(session, 0x0100, []);
+        Update(state => state with { IsConnected = true });
+        StatusMessage = $"已连接 · {State.ModelName ?? device.Name}";
+        _preferences.Address = device.Address;
+        SavePreferences();
+        var notifications = await OptionalQueryAsync(session, 0x0200, []);
+        if (notifications is { Length: >= 2 } && notifications[0] == 0 &&
+            notifications.Length >= 2 + notifications[1])
+        {
+            var codes = notifications.AsSpan(2, notifications[1]).ToArray();
+            if (session.BatchNotifications)
+                await OptionalQueryAsync(session, 0x0205, [(byte)codes.Length, ..codes]);
+            else
+                foreach (var code in codes.Intersect(new byte[] { 1, 2, 3, 6 }))
+                    await OptionalQueryAsync(session, 0x0201, [code]);
+        }
+        await RefreshCoreAsync(session);
+    }
+
     public Task DisconnectAsync() => PerformAsync(async () =>
     {
         SuppressCurrentConnection();
+        CancelRetry();
         await DisconnectCoreAsync();
         StatusMessage = "耳机控制已断开";
     });
@@ -173,7 +231,7 @@ internal sealed partial class HeadphoneService : IDisposable
 
     private void SuppressCurrentConnection()
     {
-        if (SelectedDevice is { } device) _attemptedConnections.Add(device.ObjectPath);
+        if (SelectedDevice is { } device) _suppressedConnections.Add(device.ObjectPath);
     }
 
     private void ReleaseDeviceCancellation(CancellationTokenSource cancellation)
@@ -386,13 +444,22 @@ internal sealed partial class HeadphoneService : IDisposable
 
     private async Task PollLoopAsync(Session session)
     {
+        var consecutiveTimeouts = 0;
         try
         {
             while (true)
             {
                 await Task.Delay(TimeSpan.FromSeconds(30), session.Cancellation.Token);
                 await _operations.WaitAsync(session.Cancellation.Token);
-                try { await RefreshCoreAsync(session); }
+                try
+                {
+                    await RefreshCoreAsync(session);
+                    consecutiveTimeouts = 0;
+                }
+                catch (TimeoutException) when (++consecutiveTimeouts < 2)
+                {
+                    // Tolerate a single transient timeout during earbud role switch or brief interference.
+                }
                 finally { _operations.Release(); }
             }
         }
@@ -433,7 +500,7 @@ internal sealed partial class HeadphoneService : IDisposable
     private async Task ReadLoopAsync(Session session)
     {
         var framer = new HeadphoneProtocol();
-        var huaweiFramer = session.IsHuawei ? new HuaweiHeadphoneProtocol() : null;
+        var huaweiFramer = new HuaweiHeadphoneProtocol();
         var bytes = new byte[4096];
         try
         {
@@ -441,7 +508,7 @@ internal sealed partial class HeadphoneService : IDisposable
             {
                 var count = await session.Transport.ReadAsync(bytes, session.Cancellation.Token);
                 if (count == 0) throw new IOException("耳机关闭了控制连接");
-                foreach (var packet in huaweiFramer is not null
+                foreach (var packet in session.IsHuawei
                     ? huaweiFramer.Append(bytes.AsSpan(0, count)) : framer.Append(bytes.AsSpan(0, count)))
                 {
                     if (session.IsHuawei)
@@ -469,11 +536,18 @@ internal sealed partial class HeadphoneService : IDisposable
     private void ConnectionLost(Session session, string message)
     {
         if (!ReferenceEquals(_session, session)) return;
+        _session = null;
         session.Cancellation.Cancel();
         session.Transport.Dispose();
-        Update(state => state with { IsConnected = false });
+        ReleaseDeviceCancellation(session.Cancellation);
+        ClearConnectionState();
         StatusMessage = message;
         Publish();
+        if (AutoConnect && SelectedDevice is { } device && !_suppressedConnections.Contains(device.ObjectPath))
+        {
+            _autoConnectFailures.Remove(device.ObjectPath);
+            ScheduleRetry(TimeSpan.FromSeconds(2));
+        }
     }
 
     private void ApplyPacket(Session session, HeadphonePacket packet)
@@ -486,7 +560,14 @@ internal sealed partial class HeadphoneService : IDisposable
             {
                 case 0x8103 when payload.Length == 4 && payload[0] == 0:
                     var product = $"{payload[3]:X2}{payload[2]:X2}{payload[1]:X2}";
-                    _profile = HeadphoneCatalog.Find(product, SelectedDevice?.Name);
+                    var identified = HeadphoneCatalog.Find(product, SelectedDevice?.Name)
+                        ?? HeadphoneCatalog.Find(null, SelectedDevice?.Alias);
+                    if (identified is not null)
+                    {
+                        _profile = identified;
+                        if (SelectedDevice is { } currentDevice)
+                            _preferences.DiscoveredModels[currentDevice.Address] = product;
+                    }
                     session.GameFeature = _profile?.GameFeature ?? 6;
                     state = state with { ProductId = product, ModelName = _profile?.Name ?? SelectedDevice?.Name,
                         Capabilities = _profile?.Capabilities ?? new() };
@@ -758,20 +839,41 @@ internal sealed partial class HeadphoneService : IDisposable
                 }
                 await PerformAsync(async () =>
                 {
-                    if (reset) _attemptedConnections.Clear();
-                    foreach (var path in disconnected) _attemptedConnections.Remove(path);
+                    if (reset)
+                    {
+                        _suppressedConnections.Clear();
+                        _autoConnectFailures.Clear();
+                        _resolvedDevices.Clear();
+                        CancelRetry();
+                    }
+                    foreach (var path in disconnected)
+                    {
+                        _suppressedConnections.Remove(path);
+                        _autoConnectFailures.Remove(path);
+                        _resolvedDevices.Remove(path);
+                    }
                     if (reset || SelectedDevice is { } selected && disconnected.Contains(selected.ObjectPath))
                         await DisconnectCoreAsync();
                     if (error is not null || serviceAvailable == false)
                     {
+                        CancelRetry();
                         Devices = [];
                         ApplySelection(null);
                         StatusMessage = error is null ? "系统蓝牙服务已停止" : $"蓝牙监测已中断：{error.Message}";
                         return;
                     }
                     await RefreshDevicesCoreAsync();
-                    _attemptedConnections.IntersectWith(Devices.Where(device => device.IsConnected)
-                        .Select(device => device.ObjectPath));
+                    var connectedPaths = Devices.Where(device => device.IsConnected)
+                        .Select(device => device.ObjectPath).ToHashSet();
+                    _suppressedConnections.IntersectWith(connectedPaths);
+                    _resolvedDevices.IntersectWith(connectedPaths);
+                    foreach (var stalePath in _autoConnectFailures.Keys.Where(path => !connectedPaths.Contains(path)).ToArray())
+                        _autoConnectFailures.Remove(stalePath);
+                    foreach (var device in Devices)
+                    {
+                        if (device.IsConnected && device.ServicesResolved && _resolvedDevices.Add(device.ObjectPath))
+                            _autoConnectFailures.Remove(device.ObjectPath);
+                    }
                     if (_session is not null && (!State.IsConnected ||
                         !Devices.Any(device => device.ObjectPath == SelectedDevice?.ObjectPath && device.IsConnected)))
                     {
@@ -779,19 +881,119 @@ internal sealed partial class HeadphoneService : IDisposable
                         StatusMessage = "系统蓝牙连接已断开";
                     }
                     if (!AutoConnect || _session is not null) return;
-                    var candidate = Devices.Where(device => device.IsConnected && device.ServicesResolved &&
-                            !_attemptedConnections.Contains(device.ObjectPath) &&
+                    var candidate = Devices.Where(device => device.IsConnected &&
+                            !_suppressedConnections.Contains(device.ObjectPath) &&
                             ProfileForDevice(device)?.Capabilities.SupportsRfcomm != false &&
-                            ProfileForDevice(device) != HuaweiHeadphoneCatalog.Unknown)
-                        .OrderByDescending(device => device.Address == _preferences.Address)
+                            GetAutoConnectFailures(device.ObjectPath) < MaxAutoConnectAttempts(device))
+                        .OrderByDescending(IsKnownHeadphone)
+                        .ThenByDescending(device => device.Address == _preferences.Address)
+                        .ThenByDescending(device => device.ServicesResolved)
                         .FirstOrDefault();
                     if (candidate is null) return;
                     ApplySelection(candidate);
-                    await ConnectCoreAsync();
+                    try
+                    {
+                        await ConnectCoreAsync();
+                        _autoConnectFailures.Remove(candidate.ObjectPath);
+                        CancelRetry();
+                    }
+                    catch (Exception exception) when (!_lifetime.IsCancellationRequested &&
+                        (IsIoFailure(exception) || exception is OperationCanceledException))
+                    {
+                        var failures = GetAutoConnectFailures(candidate.ObjectPath) + 1;
+                        _autoConnectFailures[candidate.ObjectPath] = failures;
+                        var maxAttempts = MaxAutoConnectAttempts(candidate);
+                        if (!IsKnownHeadphone(candidate))
+                        {
+                            StatusMessage = "未连接 · 打开耳机盒或戴上耳机后连接";
+                            return;
+                        }
+                        if (failures < maxAttempts)
+                        {
+                            StatusMessage = $"正在等待耳机控制通道就绪（重试 {failures}/{maxAttempts - 1}）…";
+                            ScheduleRetry(RetryDelay(failures));
+                            return;
+                        }
+                        throw;
+                    }
                 }, "自动连接耳机失败");
             }
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+    }
+
+    private bool IsKnownHeadphone(HeadphoneDevice device)
+    {
+        var profile = ProfileForDevice(device);
+        if (profile is not null && !ReferenceEquals(profile, HuaweiHeadphoneCatalog.Unknown))
+            return true;
+        return device.HasOppoService ||
+            device.Address == _preferences.Address ||
+            _preferences.DiscoveredModels.ContainsKey(device.Address) ||
+            _preferences.HuaweiModels.ContainsKey(device.Address) ||
+            HuaweiHeadphoneCatalog.HasBrandKeyword(device.Name) ||
+            HuaweiHeadphoneCatalog.HasBrandKeyword(device.Alias) ||
+            HeadphoneCatalog.HasBrandKeyword(device.Name) ||
+            HeadphoneCatalog.HasBrandKeyword(device.Alias);
+    }
+
+    private int MaxAutoConnectAttempts(HeadphoneDevice device) => IsKnownHeadphone(device) ? 4 : 1;
+
+    private int GetAutoConnectFailures(string objectPath) =>
+        _autoConnectFailures.TryGetValue(objectPath, out var count) ? count : 0;
+
+    private static TimeSpan RetryDelay(int failureCount) => failureCount switch
+    {
+        1 => TimeSpan.FromMilliseconds(1500),
+        2 => TimeSpan.FromSeconds(3),
+        _ => TimeSpan.FromSeconds(5)
+    };
+
+    private void ScheduleRetry(TimeSpan delay)
+    {
+        CancellationTokenSource? previous;
+        CancellationTokenSource current;
+        lock (_monitorLock)
+        {
+            if (_disposed) return;
+            previous = _retryCancellation;
+            current = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+            _retryCancellation = current;
+        }
+        previous?.Cancel();
+        previous?.Dispose();
+        _ = NotifyRetryAfterAsync(delay, current);
+    }
+
+    private async Task NotifyRetryAfterAsync(TimeSpan delay, CancellationTokenSource registration)
+    {
+        try
+        {
+            await Task.Delay(delay, registration.Token);
+            _bluetoothChanges.Writer.TryWrite(new BluetoothChange());
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            lock (_monitorLock)
+            {
+                if (ReferenceEquals(_retryCancellation, registration))
+                    _retryCancellation = null;
+                registration.Dispose();
+            }
+        }
+    }
+
+    private void CancelRetry()
+    {
+        CancellationTokenSource? retry;
+        lock (_monitorLock)
+        {
+            retry = _retryCancellation;
+            _retryCancellation = null;
+        }
+        retry?.Cancel();
+        retry?.Dispose();
     }
 
     private void DisposeBluetoothObservers()
@@ -816,7 +1018,16 @@ internal sealed partial class HeadphoneService : IDisposable
         _preferences.AutoDetect = enabled;
         _preferences.Address = SelectedDevice?.Address;
         SavePreferencesSafely();
-        if (enabled) _bluetoothChanges.Writer.TryWrite(new BluetoothChange());
+        if (enabled)
+        {
+            _suppressedConnections.Clear();
+            _autoConnectFailures.Clear();
+            _bluetoothChanges.Writer.TryWrite(new BluetoothChange());
+        }
+        else
+        {
+            CancelRetry();
+        }
     }
 
     private void SavePreferencesSafely()
@@ -895,19 +1106,33 @@ internal sealed partial class HeadphoneService : IDisposable
                     var alias = properties.TryGetValue("Alias", out var aliasValue) ? aliasValue.GetString() : address;
                     var deviceName = properties.TryGetValue("Name", out var nameValue) ? nameValue.GetString() : alias;
                     var uuids = properties.TryGetValue("UUIDs", out var uuidValue) ? uuidValue.GetArray<string>() : [];
-                    var oppoService = uuids.Any(uuid => HeadphoneTransport.ServiceUuids.Contains(uuid, StringComparer.OrdinalIgnoreCase));
+                    var matchedProfile = HeadphoneCatalog.Find(null, deviceName)
+                        ?? (alias != deviceName ? HeadphoneCatalog.Find(null, alias) : null)
+                        ?? (_preferences.DiscoveredModels.TryGetValue(address, out var discovered)
+                            ? HeadphoneCatalog.Find(discovered, deviceName) : null);
+                    var oppoService = matchedProfile is { Huawei: null } ||
+                        HeadphoneCatalog.HasBrandKeyword(deviceName) ||
+                        HeadphoneCatalog.HasBrandKeyword(alias) ||
+                        uuids.Any(uuid => HeadphoneTransport.ServiceUuids.Contains(uuid, StringComparer.OrdinalIgnoreCase));
                     // Standard SPP alone also describes serial peripherals. Only list audio devices for manual probing.
-                    var huaweiSerial = !oppoService && uuids.Contains(HuaweiHeadphoneCatalog.ServiceUuid, StringComparer.OrdinalIgnoreCase) &&
-                        uuids.Any(uuid => uuid.Equals("0000110b-0000-1000-8000-00805f9b34fb", StringComparison.OrdinalIgnoreCase) ||
-                            uuid.Equals("0000111e-0000-1000-8000-00805f9b34fb", StringComparison.OrdinalIgnoreCase));
-                    if (HeadphoneCatalog.Find(null, deviceName) is null &&
-                        !_preferences.HuaweiModels.ContainsKey(address) && !huaweiSerial &&
-                        !oppoService) continue;
+                    var hasAudioProfile = uuids.Any(uuid =>
+                        uuid.Equals("0000110b-0000-1000-8000-00805f9b34fb", StringComparison.OrdinalIgnoreCase) ||
+                        uuid.Equals("0000111e-0000-1000-8000-00805f9b34fb", StringComparison.OrdinalIgnoreCase));
+                    var huaweiSerial = matchedProfile?.Huawei is not null ||
+                        (!oppoService && (HuaweiHeadphoneCatalog.HasBrandKeyword(deviceName) ||
+                            HuaweiHeadphoneCatalog.HasBrandKeyword(alias) ||
+                            (uuids.Contains(HuaweiHeadphoneCatalog.ServiceUuid, StringComparer.OrdinalIgnoreCase) && hasAudioProfile)));
+                    var configured = address == _preferences.Address ||
+                        _preferences.HuaweiModels.ContainsKey(address) ||
+                        _preferences.DiscoveredModels.ContainsKey(address);
+                    if (matchedProfile is null && !configured && !huaweiSerial && !oppoService) continue;
                     devices.Add(new HeadphoneDevice(address, deviceName,
                         properties.TryGetValue("Connected", out var connected) && connected.GetBool(), path)
                     {
+                        Alias = alias,
                         ServicesResolved = properties.TryGetValue("ServicesResolved", out var resolved) && resolved.GetBool(),
-                        HasHuaweiSerialService = huaweiSerial
+                        HasHuaweiSerialService = huaweiSerial,
+                        HasOppoService = oppoService
                     });
                 }
             }
@@ -921,6 +1146,7 @@ internal sealed partial class HeadphoneService : IDisposable
         if (_disposed) return;
         _disposed = true;
         _lifetime.Cancel();
+        CancelRetry();
         lock (_monitorLock) _deviceCancellation?.Cancel();
         DisposeBluetoothObservers();
         _bluetoothChanges.Writer.TryComplete();
@@ -936,6 +1162,7 @@ internal sealed partial class HeadphoneService : IDisposable
         public bool? AutoConnect { get; set; }
         public HeadphoneConnectionMethod ConnectionMethod { get; set; }
         public Dictionary<string, string> HuaweiModels { get; set; } = new();
+        public Dictionary<string, string> DiscoveredModels { get; set; } = new();
     }
 
     private sealed record BluetoothChange(string? Path = null, bool Disconnected = false,
@@ -943,7 +1170,7 @@ internal sealed partial class HeadphoneService : IDisposable
 
     private sealed class Session(HeadphoneTransport transport, CancellationTokenSource cancellation, bool isHuawei)
     {
-        public bool IsHuawei { get; } = isHuawei;
+        public bool IsHuawei { get; set; } = isHuawei;
         public HeadphoneTransport Transport { get; } = transport;
         public CancellationTokenSource Cancellation { get; } = cancellation;
         public SemaphoreSlim Writes { get; } = new(1, 1);

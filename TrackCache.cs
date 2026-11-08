@@ -1,21 +1,28 @@
+using System.Collections.Immutable;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Collections.Immutable;
+using System.Text.Json.Serialization;
 using SkiaSharp;
 
 namespace LyricifyIsland;
 
 internal static class TrackCache
 {
+    internal static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        Converters = { new ImmutableByteArrayJsonConverter() }
+    };
+
     internal static ImmutableArray<byte> PreferLargerImage(ImmutableArray<byte> current, ImmutableArray<byte> incoming)
     {
         static long Area(ImmutableArray<byte> bytes)
         {
-            if (bytes.IsDefaultOrEmpty)
+            if (bytes.IsDefaultOrEmpty || ImmutableCollectionsMarshal.AsArray(bytes) is not { Length: > 0 } array)
                 return 0;
-            using var data = SKData.CreateCopy(bytes.AsSpan());
-            using var codec = SKCodec.Create(data);
+            using var stream = new MemoryStream(array, writable: false);
+            using var codec = SKCodec.Create(stream);
             return codec is null ? 0 : (long)codec.Info.Width * codec.Info.Height;
         }
         var incomingArea = Area(incoming);
@@ -28,7 +35,7 @@ internal static class TrackCache
         {
             var path = PathFor(id);
             var cached = File.Exists(path)
-                ? JsonSerializer.Deserialize<TrackInfo>(File.ReadAllBytes(path))
+                ? JsonSerializer.Deserialize<TrackInfo>(File.ReadAllBytes(path), JsonOptions)
                 : null;
             return cached?.Id == id ? cached : null;
         }
@@ -42,12 +49,14 @@ internal static class TrackCache
     public static void SaveIfChanged(TrackInfo track)
     {
         var path = PathFor(track.Id);
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(track);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(track, JsonOptions);
         var directory = Path.GetDirectoryName(path)!;
         var temporary = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
         try
         {
-            if (File.Exists(path) && File.ReadAllBytes(path).AsSpan().SequenceEqual(bytes))
+            if (File.Exists(path)
+                && new FileInfo(path).Length == bytes.Length
+                && File.ReadAllBytes(path).AsSpan().SequenceEqual(bytes))
                 return;
 
             Directory.CreateDirectory(directory);
@@ -116,5 +125,30 @@ internal static class TrackCache
             cacheHome = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cache");
         return Path.Combine(cacheHome, "lyricify-island", "tracks");
+    }
+
+    private sealed class ImmutableByteArrayJsonConverter : JsonConverter<ImmutableArray<byte>>
+    {
+        public override ImmutableArray<byte> Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            if (reader.TokenType == JsonTokenType.Null)
+                return [];
+            if (reader.TokenType == JsonTokenType.String)
+                return ImmutableCollectionsMarshal.AsImmutableArray(reader.GetBytesFromBase64());
+            if (reader.TokenType != JsonTokenType.StartArray)
+                throw new JsonException("Expected Base64 string or byte array.");
+
+            var builder = ImmutableArray.CreateBuilder<byte>();
+            while (reader.Read())
+            {
+                if (reader.TokenType == JsonTokenType.EndArray)
+                    return builder.ToImmutable();
+                builder.Add(reader.GetByte());
+            }
+            throw new JsonException("Unexpected end of byte array.");
+        }
+
+        public override void Write(Utf8JsonWriter writer, ImmutableArray<byte> value, JsonSerializerOptions options) =>
+            writer.WriteBase64StringValue(value.IsDefault ? ReadOnlySpan<byte>.Empty : value.AsSpan());
     }
 }

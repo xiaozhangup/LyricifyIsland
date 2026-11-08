@@ -6,8 +6,10 @@ internal enum HeadphoneNoiseLevel { Smart, Deep, Moderate, Light }
 
 internal sealed record HeadphoneDevice(string Address, string Name, bool IsConnected, string ObjectPath)
 {
+    public string? Alias { get; init; }
     public bool ServicesResolved { get; init; }
     public bool HasHuaweiSerialService { get; init; }
+    public bool HasOppoService { get; init; }
     public override string ToString() => Name;
 }
 

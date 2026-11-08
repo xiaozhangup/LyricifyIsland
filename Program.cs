@@ -799,6 +799,7 @@ internal static class SelfCheck
         CheckFileArtwork();
         CheckSettingsStore();
         CheckTrackCache(track);
+        CheckHeadphones();
         Require(OverlayWindow.CalculateLogicalHeight(150d) == 174d, "island height scaling");
         Require(Math.Abs(OverlayWindow.CalculateLogicalWidth(1_920, 1.25d, 70d) - 1_075.2d) < 0.001d,
             "screen width scaling");
@@ -815,6 +816,32 @@ internal static class SelfCheck
 
         Console.WriteLine("self-test: ok");
         return 0;
+    }
+
+    private static void CheckHeadphones()
+    {
+        Require(HeadphoneCatalog.Find(null, "OPPO Enco Buds3 Pro")?.Name == "OPPO Enco Buds3 Pro"
+                && HeadphoneCatalog.Find(null, "OPPO Enco Buds3 Pro+")?.Name == "OPPO Enco Buds3 Pro+",
+            "headphone plus suffix distinction");
+        Require(HeadphoneCatalog.Find(null, "小张的 OPPO Enco X3")?.Name == "OPPO Enco X3"
+                && HeadphoneCatalog.Find(null, "一加 Buds Pro 3")?.Name == "OnePlus Buds Pro 3"
+                && HeadphoneCatalog.Find(null, "我的真我 Buds Air 5 Pro")?.Name == "realme Buds Air 5 Pro",
+            "headphone localized and customized name matching");
+        Require(HeadphoneCatalog.Find(null, "小张的 HUAWEI FreeBuds Pro 3")?.ProductId == "huawei.freebudspro3"
+                && HeadphoneCatalog.Find(null, "华为智能眼镜 2")?.ProductId == "huawei.eyewear2"
+                && HeadphoneCatalog.Find("huawei.freebudspro4", null)?.ProductId == "huawei.freebudspro4"
+                && HeadphoneCatalog.Find("00016d", null)?.ProductId == "huawei.freebudspro5"
+                && HeadphoneCatalog.Find(null, "HUAWEI FreeBuds 3i") is null,
+            "Huawei headphone name and model ID lookup");
+        var modelTlv = HuaweiHeadphoneProtocol.ReadModelId(new Dictionary<byte, byte[]>
+        {
+            [0x0a] = "T0016-00016d"u8.ToArray()
+        });
+        var subCodeTlv = HuaweiHeadphoneProtocol.ReadModelId(new Dictionary<byte, byte[]>
+        {
+            [0x02] = [0x01, 0x49]
+        });
+        Require(modelTlv == "00016D" && subCodeTlv == "000149", "Huawei relaxed model ID parsing");
     }
 
     private static void CheckSettingsStore()
@@ -965,8 +992,14 @@ internal static class SelfCheck
     private static void CheckTrackCache(TrackInfo track)
     {
         var legacy = JsonSerializer.Deserialize<TrackInfo>(
-            """{"Id":"legacy","Title":"Legacy","Artists":[],"Album":"","DurationMs":1,"AlbumArtBytes":[],"Lyrics":[]}""");
-        Require(legacy is not null && legacy.ArtistImageBytes.IsEmpty, "legacy track cache");
+            """{"Id":"legacy","Title":"Legacy","Artists":[],"Album":"","DurationMs":1,"AlbumArtBytes":[1,2,3],"Lyrics":[]}""",
+            TrackCache.JsonOptions);
+        Require(legacy is not null
+                && legacy.AlbumArtBytes.SequenceEqual(new byte[] { 1, 2, 3 })
+                && legacy.ArtistImageBytes.IsEmpty,
+            "legacy track cache");
+        var serialized = JsonSerializer.Serialize(legacy, TrackCache.JsonOptions);
+        Require(serialized.Contains($"\"{Convert.ToBase64String([1, 2, 3])}\""), "base64 track cache serialization");
 
         var previousCacheHome = Environment.GetEnvironmentVariable("XDG_CACHE_HOME");
         var cacheHome = Path.Combine(Path.GetTempPath(), $"lyricify-island-cache-test-{Guid.NewGuid():N}");

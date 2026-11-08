@@ -16,13 +16,13 @@ internal sealed class HeadphoneTransport : IDisposable
     private HeadphoneTransport(SafeFileHandle socket) => _socket = socket;
 
     public static async Task<HeadphoneTransport> ConnectAsync(
-        string address, HeadphoneConnectionMethod method, string? serviceUuid, CancellationToken cancellationToken)
+        string address, HeadphoneConnectionMethod method, string? serviceUuid, bool isHuawei, CancellationToken cancellationToken)
     {
-        var huawei = serviceUuid == HuaweiHeadphoneCatalog.ServiceUuid;
         // Channel 15 belongs to the OPPO protocol, including when saved as a global preference.
-        if (huawei) method = HeadphoneConnectionMethod.Uuid;
-        IReadOnlyList<string> serviceUuids = huawei ? [HuaweiHeadphoneCatalog.ServiceUuid]
-            : serviceUuid is null ? ServiceUuids : new[] { serviceUuid }.Concat(ServiceUuids).Distinct().ToArray();
+        if (isHuawei) method = HeadphoneConnectionMethod.Uuid;
+        IReadOnlyList<string> serviceUuids = isHuawei ? [HuaweiHeadphoneCatalog.ServiceUuid]
+            : serviceUuid is null ? ServiceUuids
+            : new[] { serviceUuid }.Concat(ServiceUuids).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         var channels = new List<int>();
         if (method != HeadphoneConnectionMethod.Channel15)
         {
@@ -44,7 +44,7 @@ internal sealed class HeadphoneTransport : IDisposable
         if (method != HeadphoneConnectionMethod.Uuid && !channels.Contains(15))
             channels.Add(15);
         if (channels.Count == 0)
-            throw new IOException(huawei ? "耳机未提供控制服务，请确认已在系统蓝牙中连接"
+            throw new IOException(isHuawei ? "耳机未提供控制服务，请确认已在系统蓝牙中连接"
                 : "耳机未提供控制服务，可尝试兼容连接");
 
         Exception? primaryError = null;
@@ -150,7 +150,7 @@ internal sealed class HeadphoneTransport : IDisposable
         using var handle = await OpenSocketAsync(address, 0, true, cancellationToken);
         var channels = new List<int>();
         ushort transaction = 0;
-        foreach (var uuid in serviceUuids)
+        async Task QueryUuidAsync(string uuid)
         {
             byte[] continuation = [];
             var attributes = new List<byte>();
@@ -181,6 +181,11 @@ internal sealed class HeadphoneTransport : IDisposable
             while (index < attributes.Count)
                 CollectRfcommChannels(ReadElement(attributes.ToArray(), ref index, 0), channels);
         }
+        foreach (var uuid in serviceUuids)
+            await QueryUuidAsync(uuid);
+        // Some OPPO/OnePlus models (e.g. Enco X, Enco Free, Enco W51, Buds Z) expose RFCOMM on standard SPP.
+        if (channels.Count == 0 && !serviceUuids.Contains(HuaweiHeadphoneCatalog.ServiceUuid, StringComparer.OrdinalIgnoreCase))
+            await QueryUuidAsync(HuaweiHeadphoneCatalog.ServiceUuid);
         return channels.Distinct().ToArray();
     }
 

@@ -23,19 +23,66 @@ internal static class HeadphoneCatalog
 
     public static HeadphoneProfile? Find(string? productId, string? name)
     {
-        if (productId is not null && Profiles.FirstOrDefault(p =>
-                p.ProductId.Equals(productId, StringComparison.OrdinalIgnoreCase)) is { } identified)
-            return identified;
-        if (name is null)
+        if (productId is not null)
+        {
+            if (HuaweiHeadphoneCatalog.FindById(productId) is { } huaweiById)
+                return huaweiById;
+            if (HuaweiHeadphoneCatalog.FindByModelId(productId) is { } huaweiByModel)
+                return huaweiByModel;
+            if (Profiles.FirstOrDefault(p =>
+                    p.ProductId.Equals(productId, StringComparison.OrdinalIgnoreCase)) is { } identified)
+                return identified;
+        }
+        if (string.IsNullOrWhiteSpace(name))
             return null;
-        if (HuaweiHeadphoneCatalog.FindByName(name) is { } huawei)
-            return huawei;
+        if (HuaweiHeadphoneCatalog.FindByName(name, exactOnly: true) is { } exactHuawei)
+            return exactHuawei;
         var normalized = Normalize(name);
-        return Profiles.FirstOrDefault(p => Normalize(p.Name) == normalized);
+        if (normalized.Length == 0)
+            return null;
+        if (Profiles.FirstOrDefault(p => Normalize(p.Name) == normalized) is { } exactOppo)
+            return exactOppo;
+        if (HuaweiHeadphoneCatalog.FindByName(name, exactOnly: false) is { } fuzzyHuawei)
+            return fuzzyHuawei;
+        return Profiles
+            .OrderByDescending(p => Normalize(p.Name).Length)
+            .FirstOrDefault(p => ContainsModelKey(normalized, Normalize(p.Name)));
+    }
+
+    internal static bool ContainsModelKey(string normalizedName, ReadOnlySpan<char> normalizedKey)
+    {
+        if (normalizedKey.Length == 0 || normalizedName.Length < normalizedKey.Length)
+            return false;
+        var span = normalizedName.AsSpan();
+        var offset = 0;
+        while (offset <= span.Length - normalizedKey.Length)
+        {
+            var match = span[offset..].IndexOf(normalizedKey, StringComparison.OrdinalIgnoreCase);
+            if (match < 0) return false;
+            var end = offset + match + normalizedKey.Length;
+            if (end == span.Length || (!char.IsAsciiLetterOrDigit(span[end]) && span[end] != '+'))
+                return true;
+            offset += match + 1;
+        }
+        return false;
+    }
+
+    public static bool HasBrandKeyword(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        var normalized = Normalize(name);
+        return normalized.Contains("OPPO", StringComparison.Ordinal) ||
+            normalized.Contains("ENCO", StringComparison.Ordinal) ||
+            normalized.Contains("ONEPLUS", StringComparison.Ordinal) ||
+            normalized.Contains("REALME", StringComparison.Ordinal) ||
+            normalized.Contains("DIZO", StringComparison.Ordinal);
     }
 
     private static string Normalize(string name) =>
-        string.Concat(name.Where(char.IsLetterOrDigit)).ToUpperInvariant();
+        string.Concat(name
+            .Replace("一加", "OnePlus", StringComparison.Ordinal)
+            .Replace("真我", "realme", StringComparison.Ordinal)
+            .Where(c => char.IsLetterOrDigit(c) || c == '+')).ToUpperInvariant();
 
     private static HeadphoneProfile[] Load()
     {

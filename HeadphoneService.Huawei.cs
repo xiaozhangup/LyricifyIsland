@@ -14,8 +14,14 @@ internal sealed partial class HeadphoneService
         if (_preferences.HuaweiModels.TryGetValue(device.Address, out var id) &&
             HuaweiHeadphoneCatalog.FindById(id) is { } selected)
             return selected;
-        return HeadphoneCatalog.Find(null, device.Name)
-            ?? (device.HasHuaweiSerialService ? HuaweiHeadphoneCatalog.Unknown : null);
+        if (HeadphoneCatalog.Find(null, device.Name) is { } byName)
+            return byName;
+        if (device.Alias != device.Name && HeadphoneCatalog.Find(null, device.Alias) is { } byAlias)
+            return byAlias;
+        if (_preferences.DiscoveredModels.TryGetValue(device.Address, out var discovered) &&
+            HeadphoneCatalog.Find(discovered, device.Name) is { } byDiscovered)
+            return byDiscovered;
+        return device.HasHuaweiSerialService && !device.HasOppoService ? HuaweiHeadphoneCatalog.Unknown : null;
     }
 
     public Task SetHuaweiModelAsync(string id) => PerformAsync(async () =>
@@ -28,7 +34,8 @@ internal sealed partial class HeadphoneService
         else _preferences.HuaweiModels[device.Address] = id;
         ApplySelection(device);
         SavePreferences();
-        _attemptedConnections.Remove(device.ObjectPath);
+        _suppressedConnections.Remove(device.ObjectPath);
+        _autoConnectFailures.Remove(device.ObjectPath);
         _bluetoothChanges.Writer.TryWrite(new BluetoothChange());
     }, "保存耳机型号失败");
 
@@ -36,11 +43,11 @@ internal sealed partial class HeadphoneService
     {
         if (State.Capabilities.HasBattery)
         {
-            // Verified identity takes precedence over a Bluetooth name or a manual selection.
+            // Verified identity takes precedence over a Bluetooth name unless manually overridden.
             await OptionalQueryAsync(session, 0x0107,
                 [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0, 11, 0, 12, 0, 15, 0, 24, 0, 25, 0]);
         }
-        await RefreshHuaweiAsync(session);
+        await RefreshHuaweiAsync(session, initialHandshake: true);
         session.Cancellation.Token.ThrowIfCancellationRequested();
         Update(state => state with { IsConnected = true });
         StatusMessage = $"已连接 · {State.ModelName}";
@@ -48,10 +55,21 @@ internal sealed partial class HeadphoneService
         SavePreferences();
     }
 
-    private async Task RefreshHuaweiAsync(Session session)
+    private async Task RefreshHuaweiAsync(Session session, bool initialHandshake = false)
     {
         var capabilities = State.Capabilities;
-        if (capabilities.HasBattery) await RequestAsync(session, 0x0108, [1, 0, 2, 0, 3, 0]);
+        if (capabilities.HasBattery)
+        {
+            try
+            {
+                await RequestAsync(session, 0x0108, [1, 0, 2, 0, 3, 0]);
+            }
+            catch (TimeoutException) when (initialHandshake && !session.Cancellation.IsCancellationRequested)
+            {
+                await Task.Delay(250, session.Cancellation.Token);
+                await RequestAsync(session, 0x0108, [1, 0, 2, 0, 3, 0]);
+            }
+        }
         if (capabilities.NoiseModes.Count > 0 && capabilities.CanReadNoiseMode)
             await OptionalQueryAsync(session, 0x2b2a, [1, 0]);
         if (capabilities.HasWearDetection) await OptionalQueryAsync(session, 0x2b11, [1, 0]);
@@ -71,7 +89,15 @@ internal sealed partial class HeadphoneService
             {
                 if (HuaweiHeadphoneProtocol.ReadModelId(fields) is { } modelId)
                 {
-                    _profile = HuaweiHeadphoneCatalog.FindByModelId(modelId) ?? HuaweiHeadphoneCatalog.Unknown;
+                    var identified = HuaweiHeadphoneCatalog.FindByModelId(modelId);
+                    if (identified is not null)
+                    {
+                        if (SelectedDevice is { } device)
+                            _preferences.DiscoveredModels[device.Address] = identified.ProductId;
+                        if (string.IsNullOrEmpty(HuaweiModelOverride))
+                            _profile = identified;
+                    }
+                    _profile ??= HuaweiHeadphoneCatalog.Unknown;
                     state = state with
                     {
                         ProductId = modelId, ModelName = _profile.Name, Capabilities = _profile.Capabilities

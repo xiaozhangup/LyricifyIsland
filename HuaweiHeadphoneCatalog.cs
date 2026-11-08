@@ -50,23 +50,56 @@ internal static class HuaweiHeadphoneCatalog
 
     public static HeadphoneProfile Unknown { get; } = Model("unknown", "耳机（型号未识别）");
 
-    public static HeadphoneProfile? FindById(string id) => Profiles.FirstOrDefault(p => p.ProductId == id);
-    public static HeadphoneProfile? FindByModelId(string id) => Profiles.FirstOrDefault(p => p.Huawei!.ModelId == id);
+    public static HeadphoneProfile? FindById(string id) =>
+        Profiles.FirstOrDefault(p => p.ProductId.Equals(id, StringComparison.OrdinalIgnoreCase));
+    public static HeadphoneProfile? FindByModelId(string id) =>
+        Profiles.FirstOrDefault(p => string.Equals(p.Huawei!.ModelId, id, StringComparison.OrdinalIgnoreCase));
 
-    public static HeadphoneProfile? FindByName(string name)
+    public static HeadphoneProfile? FindByName(string? name, bool exactOnly = false)
     {
-        var normalized = string.Concat(name.Where(char.IsLetterOrDigit)).ToUpperInvariant();
-        if (normalized.StartsWith("HUAWEI", StringComparison.Ordinal)) normalized = normalized[6..];
-        if (normalized.StartsWith("华为", StringComparison.Ordinal)) normalized = normalized[2..];
-        normalized = normalized switch
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        var normalized = Normalize(name);
+        if (normalized.Length == 0) return null;
+        var stripped = normalized;
+        if (stripped.StartsWith("HUAWEI", StringComparison.Ordinal)) stripped = stripped[6..];
+        if (stripped.StartsWith("HONOR", StringComparison.Ordinal)) stripped = stripped[5..];
+        if (stripped.StartsWith("华为", StringComparison.Ordinal)) stripped = stripped[2..];
+        if (stripped.StartsWith("荣耀", StringComparison.Ordinal)) stripped = stripped[2..];
+        var exact = Profiles.FirstOrDefault(p =>
+            p.ProductId.AsSpan(7).Equals(stripped, StringComparison.OrdinalIgnoreCase));
+        if (exact is not null || exactOnly) return exact;
+
+        foreach (var profile in Profiles.OrderByDescending(p => p.ProductId.Length))
         {
-            "智能眼镜" => "EYEWEAR",
-            "智能眼镜2" => "EYEWEAR2",
-            "智能眼镜3" => "EYEWEAR3",
-            _ => normalized
-        };
-        return Profiles.FirstOrDefault(p => p.ProductId.AsSpan(7).Equals(normalized, StringComparison.OrdinalIgnoreCase));
+            var key = profile.ProductId.AsSpan(7);
+            // Eyewear requires an explicit brand or Chinese eyewear keyword when matching as a substring.
+            if (key.StartsWith("eyewear", StringComparison.OrdinalIgnoreCase) &&
+                !name.Contains("智能眼镜", StringComparison.Ordinal) &&
+                !normalized.Contains("HUAWEI", StringComparison.Ordinal) &&
+                !normalized.Contains("华为", StringComparison.Ordinal))
+                continue;
+            if ( HeadphoneCatalog.ContainsModelKey(normalized, key))
+                return profile;
+        }
+        return null;
     }
+
+    public static bool HasBrandKeyword(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        var normalized = Normalize(name);
+        return normalized.Contains("HUAWEI", StringComparison.Ordinal) ||
+            normalized.Contains("华为", StringComparison.Ordinal) ||
+            normalized.Contains("FREEBUDS", StringComparison.Ordinal) ||
+            normalized.Contains("FREECLIP", StringComparison.Ordinal) ||
+            normalized.Contains("FREEARC", StringComparison.Ordinal) ||
+            normalized.Contains("FREELACE", StringComparison.Ordinal) ||
+            name.Contains("智能眼镜", StringComparison.Ordinal);
+    }
+
+    private static string Normalize(string name) =>
+        string.Concat(name.Replace("智能眼镜", "EYEWEAR", StringComparison.Ordinal)
+            .Where(c => char.IsLetterOrDigit(c) || c == '+')).ToUpperInvariant();
 
     private static HeadphoneProfile Model(string id, string name, string? modelId = null,
         bool anc = false, bool transparency = false, (HeadphoneNoiseLevel Level, int Index)[]? levels = null,

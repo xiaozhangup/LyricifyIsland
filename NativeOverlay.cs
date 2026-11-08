@@ -21,7 +21,7 @@ internal sealed class NativeOverlay : IDisposable
     private readonly object _target;
     private readonly PropertyInfo _surfaceProperty;
     private readonly PropertyInfo _globalsProperty;
-    private readonly FieldInfo _topLevelField;
+    private readonly FieldInfo? _topLevelField;
     private readonly Action<Action> _post;
     private readonly DispatcherTimer _reconnectTimer;
     private State _state = new(default, false, null, default, false);
@@ -37,15 +37,20 @@ internal sealed class NativeOverlay : IDisposable
     private bool _checkedManager;
     private State? _applied;
 
-    private NativeOverlay(Window window, object target, object worker, Type surfaceType)
+    private NativeOverlay(
+        Window window,
+        object target,
+        PropertyInfo surfaceProperty,
+        PropertyInfo globalsProperty,
+        FieldInfo? topLevelField,
+        Action<Action> post)
     {
         _window = window;
         _target = target;
-        _surfaceProperty = surfaceType.GetProperty("WlSurface", InstanceMembers)!;
-        _globalsProperty = surfaceType.GetProperty("Globals", InstanceMembers)!;
-        _topLevelField = target.GetType().GetField("_xdgTopLevel", InstanceMembers)!;
-        _post = worker.GetType().GetMethod("PostOob", InstanceMembers)!
-            .CreateDelegate<Action<Action>>(worker);
+        _surfaceProperty = surfaceProperty;
+        _globalsProperty = globalsProperty;
+        _topLevelField = topLevelField;
+        _post = post;
         _reconnectTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _reconnectTimer.Tick += (_, _) => QueueUpdate();
         _reconnectTimer.Start();
@@ -56,16 +61,39 @@ internal sealed class NativeOverlay : IDisposable
         if (!OperatingSystem.IsLinux())
             return null;
 
-        // Avalonia 12.1.1 does not expose its Wayland surface publicly. Access it on
-        // Avalonia's own worker thread and keep this adapter tied to that version.
-        var implementation = window.PlatformImpl!;
-        var proxy = implementation.GetType().GetField("_surfaceProxy", InstanceMembers)!.GetValue(implementation)!;
-        var target = proxy.GetType().GetProperty("ProxyTarget", InstanceMembers | BindingFlags.DeclaredOnly)!.GetValue(proxy)!;
-        var surfaceType = target.GetType();
-        while (surfaceType.Name != "WSurface")
-            surfaceType = surfaceType.BaseType!;
-        var worker = surfaceType.GetProperty("Worker", InstanceMembers)!.GetValue(target)!;
-        return new NativeOverlay(window, target, worker, surfaceType);
+        try
+        {
+            // Avalonia 12.1.1 does not expose its Wayland surface publicly. Access it on
+            // Avalonia's own worker thread and fall back cleanly if the backend or internals differ.
+            if (window.PlatformImpl is not { } implementation)
+                return null;
+            var proxy = implementation.GetType().GetField("_surfaceProxy", InstanceMembers)?.GetValue(implementation);
+            var target = proxy?.GetType().GetProperty("ProxyTarget", InstanceMembers | BindingFlags.DeclaredOnly)?.GetValue(proxy);
+            if (target is null)
+                return null;
+
+            var surfaceType = target.GetType();
+            while (surfaceType is not null && surfaceType.Name != "WSurface")
+                surfaceType = surfaceType.BaseType;
+            if (surfaceType is null)
+                return null;
+
+            var worker = surfaceType.GetProperty("Worker", InstanceMembers)?.GetValue(target);
+            var surfaceProperty = surfaceType.GetProperty("WlSurface", InstanceMembers);
+            var globalsProperty = surfaceType.GetProperty("Globals", InstanceMembers);
+            var topLevelField = target.GetType().GetField("_xdgTopLevel", InstanceMembers);
+            var postMethod = worker?.GetType().GetMethod("PostOob", InstanceMembers);
+            if (worker is null || surfaceProperty is null || globalsProperty is null || postMethod is null)
+                return null;
+
+            var post = postMethod.CreateDelegate<Action<Action>>(worker);
+            return new NativeOverlay(window, target, surfaceProperty, globalsProperty, topLevelField, post);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[wayland] Native overlay unavailable: {exception.Message}");
+            return null;
+        }
     }
 
     public void SetInputRegion(Rect logicalBounds, double? cornerRadius = null)
@@ -99,77 +127,87 @@ internal sealed class NativeOverlay : IDisposable
 
     private void ApplyOnWorker(State state)
     {
-        var surface = (WlSurface?)_surfaceProperty.GetValue(_target);
-        var globals = _globalsProperty.GetValue(_target);
-        if (surface is null || globals is null)
+        try
         {
-            _surface = null;
-            _globals = null;
-            _compositor = null;
-            _manager = null;
-            _effect = null;
-            _checkedManager = false;
-            _applied = null;
-            return;
-        }
-
-        if (!ReferenceEquals(surface, _surface))
-        {
-            _surface = surface;
-            _globals = globals;
-            var type = globals.GetType();
-            _compositor = (WlCompositor)type.GetProperty("WlCompositor", InstanceMembers)!.GetValue(globals)!;
-            ((XdgToplevel)_topLevelField.GetValue(_target)!).SetAppId("lyricify-island");
-            _manager = null;
-            _effect = null;
-            _checkedManager = false;
-            _applied = null;
-        }
-
-        if (state == _applied)
-            return;
-
-        if (_applied is null || state.InputBounds != _applied.InputBounds
-            || state.InputTransparent != _applied.InputTransparent || state.CornerRadius != _applied.CornerRadius)
-        {
-            var input = _compositor!.CreateRegion();
-            if (!state.InputTransparent)
+            var surface = (WlSurface?)_surfaceProperty.GetValue(_target);
+            var globals = _globalsProperty.GetValue(_target);
+            if (surface is null || globals is null)
             {
-                var rows = state.CornerRadius is { } radius
-                    ? RoundedRows(state.InputBounds, radius)
-                    : CapsuleRows(state.InputBounds);
-                AddRows(input, rows);
+                _surface = null;
+                _globals = null;
+                _compositor = null;
+                _manager = null;
+                _effect = null;
+                _checkedManager = false;
+                _applied = null;
+                return;
             }
-            surface.SetInputRegion(input);
-            input.Destroy();
-        }
 
-        if (state.Blur && !_checkedManager)
-        {
-            var bind = globals.GetType().GetMethod("Bind", InstanceMembers)!
-                .MakeGenericMethod(typeof(ExtBackgroundEffectManagerV1));
-            _manager = (ExtBackgroundEffectManagerV1?)bind.Invoke(globals, [1u, 1u, new BlurListener()]);
-            _checkedManager = true;
-            if (_manager is null)
-                Console.Error.WriteLine("[wayland] The compositor does not support ext-background-effect-v1.");
-        }
-        if (_manager is not null && (_applied is null || state.Blur != _applied.Blur
-                                    || state.Blur && state.BlurBounds != _applied.BlurBounds))
-        {
-            if (state.Blur)
+            if (!ReferenceEquals(surface, _surface))
             {
-                _effect ??= _manager.GetBackgroundEffect(surface);
-                var region = _compositor!.CreateRegion();
-                AddRows(region, CapsuleRows(state.BlurBounds));
-                _effect.SetBlurRegion(region);
-                region.Destroy();
+                _surface = surface;
+                _globals = globals;
+                var type = globals.GetType();
+                _compositor = (WlCompositor?)type.GetProperty("WlCompositor", InstanceMembers)?.GetValue(globals);
+                if (_topLevelField?.GetValue(_target) is XdgToplevel topLevel)
+                    topLevel.SetAppId("lyricify-island");
+                _manager = null;
+                _effect = null;
+                _checkedManager = false;
+                _applied = null;
             }
-            else if (_effect is not null)
-                _effect.SetBlurRegion(null!);
+
+            if (_compositor is null || state == _applied)
+                return;
+
+            if (_applied is null || state.InputBounds != _applied.InputBounds
+                || state.InputTransparent != _applied.InputTransparent || state.CornerRadius != _applied.CornerRadius)
+            {
+                var input = _compositor.CreateRegion();
+                if (!state.InputTransparent)
+                {
+                    var rows = state.CornerRadius is { } radius
+                        ? RoundedRows(state.InputBounds, radius)
+                        : CapsuleRows(state.InputBounds);
+                    AddRows(input, rows);
+                }
+                surface.SetInputRegion(input);
+                input.Destroy();
+            }
+
+            if (state.Blur && !_checkedManager)
+            {
+                var bind = globals.GetType().GetMethod("Bind", InstanceMembers)?
+                    .MakeGenericMethod(typeof(ExtBackgroundEffectManagerV1));
+                _manager = (ExtBackgroundEffectManagerV1?)bind?.Invoke(globals, [1u, 1u, new BlurListener()]);
+                _checkedManager = true;
+                if (_manager is null)
+                    Console.Error.WriteLine("[wayland] The compositor does not support ext-background-effect-v1.");
+            }
+            if (_manager is not null && (_applied is null || state.Blur != _applied.Blur
+                                        || state.Blur && state.BlurBounds != _applied.BlurBounds))
+            {
+                if (state.Blur)
+                {
+                    _effect ??= _manager.GetBackgroundEffect(surface);
+                    var region = _compositor.CreateRegion();
+                    AddRows(region, CapsuleRows(state.BlurBounds));
+                    _effect.SetBlurRegion(region);
+                    region.Destroy();
+                }
+                else if (_effect is not null)
+                    _effect.SetBlurRegion(null!);
+            }
+            _applied = state;
+            // Both regions are double-buffered; let Avalonia perform the next surface commit.
+            Dispatcher.UIThread.Post(_window.InvalidateVisual);
         }
-        _applied = state;
-        // Both regions are double-buffered; let Avalonia perform the next surface commit.
-        Dispatcher.UIThread.Post(_window.InvalidateVisual);
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"[wayland] Native overlay update failed: {exception.Message}");
+            _disposed = true;
+            Dispatcher.UIThread.Post(_reconnectTimer.Stop);
+        }
     }
 
     private static void AddRows(WlRegion region, PixelRect[] rows)

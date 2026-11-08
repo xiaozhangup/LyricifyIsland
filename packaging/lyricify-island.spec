@@ -2,7 +2,7 @@
 %global __provides_exclude_from ^%{_libdir}/%{name}/.*\.so$
 
 Name:           lyricify-island
-Version:        0.1.11
+Version:        0.1.12
 Release:        1.0%{?dist}
 Summary:        Desktop lyrics island for Spotify and MPRIS
 License:        Apache-2.0 AND GPL-3.0-or-later AND MIT AND BSD-3-Clause

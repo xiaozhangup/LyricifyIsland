@@ -171,6 +171,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
     private bool _draggingLyrics;
     private bool _busy;
     private bool _queued;
+    private IDisposable? _idleFrame;
     private readonly FrameScheduler _frameScheduler = new();
     private bool _disposed;
     private string? _toast;
@@ -201,17 +202,24 @@ internal sealed class LyricsWindowControl : Control, IDisposable
         _setIslandVisibility = setIslandVisibility;
         Focusable = true;
         AutomationProperties.SetName(this, "歌词窗口：空格播放暂停，方向键快进快退，Home 回到当前歌词，F11 全屏");
-        AttachedToVisualTree += (_, _) => QueueFrame();
+        AttachedToVisualTree += (_, _) => WakeRender();
         PointerPressed += OnPressed;
         PointerMoved += OnMoved;
         PointerReleased += OnReleased;
-        PointerCaptureLost += (_, _) => CancelGesture();
-        PointerExited += (_, _) => { _pointer = new Point(-1, -1); InvalidateVisual(); };
+        PointerCaptureLost += (_, _) => { CancelGesture(); WakeRender(); };
+        PointerExited += (_, _) => { _pointer = new Point(-1, -1); WakeRender(); };
         PointerWheelChanged += OnWheel;
         KeyDown += OnKeyDown;
+        _store.Changed += OnPlaybackChanged;
         _headphones.StateChanged += OnHeadphonesChanged;
         UpdateHeadphones();
     }
+
+    private void OnPlaybackChanged(object? sender, EventArgs args) => Dispatcher.UIThread.Post(() =>
+    {
+        if (!_disposed)
+            WakeRender();
+    });
 
     private void OnHeadphonesChanged(object? sender, EventArgs args) => Dispatcher.UIThread.Post(() =>
     {
@@ -231,7 +239,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
                 Busy = _headphones.IsBusy
             }
             : null;
-        InvalidateVisual();
+        WakeRender();
     }
 
     private static string BatteryText(HeadphoneState state, bool includeCharging)
@@ -250,16 +258,28 @@ internal sealed class LyricsWindowControl : Control, IDisposable
     public void ApplySettings(IslandSettings settings)
     {
         _settings = settings;
-        InvalidateVisual();
+        WakeRender();
     }
 
-    internal void ResumeAnimation() => QueueFrame();
+    internal void ResumeAnimation() => WakeRender();
+
+    private void WakeRender()
+    {
+        if (_disposed) return;
+        _idleFrame?.Dispose();
+        _idleFrame = null;
+        _renderer.MarkDirty();
+        InvalidateVisual();
+        QueueFrame();
+    }
 
     private double PanelProgress(double now)
     {
         var t = Math.Clamp((now - _panelStart) / .34, 0, 1);
         return _panelFrom + (_panelTarget - _panelFrom) * (1 - Math.Pow(1 - t, 3));
     }
+
+    private bool InPanelTransition => _clock.Elapsed.TotalSeconds - _panelStart < .36;
 
     /// <summary>Slides the settings/headphone panel in or out over the player and lyrics.</summary>
     public void SetPanel(PanelKind? kind)
@@ -273,13 +293,30 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             _panelTarget = target;
         }
         _panelKind = kind;
-        QueueFrame();
-        InvalidateVisual();
+        WakeRender();
     }
 
     private void QueueFrame()
     {
         if (_disposed || _queued || TopLevel.GetTopLevel(this) is not { } top) return;
+        var now = _clock.Elapsed.TotalSeconds;
+        var panelCovered = _panelKind is not null && PanelProgress(now) >= .999 && !InPanelTransition;
+        if ((!_store.Snapshot.IsPlaying || panelCovered) && !_renderer.IsAnimating && !InPanelTransition)
+        {
+            if (_browseScroll.HasValue || now < _toastUntil)
+            {
+                _idleFrame?.Dispose();
+                _idleFrame = DispatcherTimer.RunOnce(() =>
+                {
+                    _idleFrame = null;
+                    if (_disposed || !this.IsAttachedToVisualTree()) return;
+                    WakeRender();
+                }, TimeSpan.FromMilliseconds(100));
+            }
+            return;
+        }
+        _idleFrame?.Dispose();
+        _idleFrame = null;
         _queued = true;
         _frameScheduler.Request(top, _ =>
         {
@@ -355,7 +392,10 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             args.Pointer.Capture(this);
         }
         else if (_pressed is not null)
+        {
             args.Pointer.Capture(this);
+            WakeRender();
+        }
         else if (point.Y < 68 || Layout.Cover.Contains(point))
             MoveWindow?.Invoke(args);
         args.Handled = true;
@@ -409,7 +449,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             _cursorType = cursor;
             previousCursor?.Dispose();
         }
-        InvalidateVisual();
+        WakeRender();
     }
 
     private void UpdateSlider(Point point)
@@ -418,7 +458,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
         var fraction = Math.Clamp((point.X - _pressed.Bounds.Left) / _pressed.Bounds.Width, 0, 1);
         if (_pressed.Action == LyricsWindowAction.Seek) _seekPreview = fraction * (_store.Snapshot.Track?.DurationMs ?? 0);
         else _volumePreview = fraction;
-        InvalidateVisual();
+        WakeRender();
     }
 
     private void OnReleased(object? sender, PointerReleasedEventArgs args)
@@ -432,6 +472,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
         var point = args.GetPosition(this);
         CancelGesture();
         args.Pointer.Capture(null);
+        WakeRender();
         if (pressed is null) return;
         if (trackId != _store.Snapshot.Track?.Id && pressed.Action is not
             (LyricsWindowAction.Headphones or LyricsWindowAction.HeadphoneNoiseOff
@@ -457,7 +498,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
     {
         _browseScroll = Math.Clamp(position, -Layout.Lyrics.Height * .25, _renderer.MaxScroll);
         _browseUntil = _clock.Elapsed.TotalSeconds + 5;
-        InvalidateVisual();
+        WakeRender();
     }
 
     private void Activate(LyricsWindowHit hit)
@@ -494,7 +535,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
                 break;
             default: WindowAction?.Invoke(hit.Action); break;
         }
-        InvalidateVisual();
+        WakeRender();
         return;
         void Send(PlaybackAction action, double value = 0) => _ = SendAsync(new PlaybackCommand(action, value, track?.Id));
     }
@@ -510,6 +551,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
     {
         if (_busy || _disposed) return;
         _busy = true;
+        WakeRender();
         try
         {
             var error = await _controlPlayback(command, _lifetime.Token);
@@ -533,13 +575,14 @@ internal sealed class LyricsWindowControl : Control, IDisposable
                 else Toast("播放控制失败，请检查播放器连接");
             }
         }
-        finally { _busy = false; if (!_disposed) InvalidateVisual(); }
+        finally { _busy = false; if (!_disposed) WakeRender(); }
     }
 
     private void Toast(string message)
     {
         _toast = message;
         _toastUntil = _clock.Elapsed.TotalSeconds + 6;
+        WakeRender();
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs args)
@@ -569,7 +612,7 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             default: return;
         }
         args.Handled = true;
-        InvalidateVisual();
+        WakeRender();
     }
 
     private void CancelGesture()
@@ -586,7 +629,10 @@ internal sealed class LyricsWindowControl : Control, IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        _idleFrame?.Dispose();
+        _idleFrame = null;
         _frameScheduler.Dispose();
+        _store.Changed -= OnPlaybackChanged;
         _headphones.StateChanged -= OnHeadphonesChanged;
         _lifetime.Cancel();
         _lifetime.Dispose();

@@ -92,18 +92,26 @@ internal sealed class HuaweiHeadphoneProtocol
 
     public static string? ReadModelId(Dictionary<byte, byte[]> fields)
     {
-        if (!fields.TryGetValue(0x0a, out var model) || model.Length is < 8 or > 64 ||
-            !fields.TryGetValue(0x0f, out var prefix) || prefix.Length != model.Length - 7 ||
-            !fields.TryGetValue(0x02, out var code) || code.Length != 2 ||
-            !fields.TryGetValue(0x19, out var color) || color.Length != 1)
-            return null;
-        if (!model.AsSpan(0, prefix.Length).SequenceEqual(prefix) || model[prefix.Length] != '-' ||
-            prefix.Any(value => value is not (>= (byte)'A' and <= (byte)'Z' or >= (byte)'0' and <= (byte)'9')))
-            return null;
-        var id = Encoding.ASCII.GetString(model.AsSpan(model.Length - 6));
-        if (!id.All(char.IsAsciiHexDigit) || id == "00000A" || !id.EndsWith(Convert.ToHexString(code), StringComparison.Ordinal))
-            return null;
-        return id;
+        if (fields.TryGetValue(0x0a, out var model) && model.Length is >= 6 and <= 64)
+        {
+            var text = Encoding.ASCII.GetString(model).Trim('\0', ' ');
+            var dash = text.LastIndexOf('-');
+            var candidate = dash >= 0 ? text[(dash + 1)..] : text;
+            if (candidate.Length == 6 && candidate.All(char.IsAsciiHexDigit) &&
+                !candidate.Equals("00000A", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!fields.TryGetValue(0x02, out var subCode) || subCode.Length != 2 ||
+                    candidate.EndsWith(Convert.ToHexString(subCode), StringComparison.OrdinalIgnoreCase))
+                    return candidate.ToUpperInvariant();
+            }
+        }
+        if (fields.TryGetValue(0x02, out var code) && code.Length == 2)
+        {
+            var candidate = "00" + Convert.ToHexString(code);
+            if (HuaweiHeadphoneCatalog.FindByModelId(candidate) is not null)
+                return candidate;
+        }
+        return null;
     }
 
     public static HeadphoneState ReadState(HeadphoneState state, HeadphoneProfile profile, ushort command,

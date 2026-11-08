@@ -1155,7 +1155,7 @@ internal sealed class IslandRenderer : IDisposable
         return new Rect(bounds.Center.X - width / 2d, bounds.Center.Y - height / 2d, width, height);
     }
 
-    private static SKRect PillRect(
+    private SKRect PillRect(
         float width,
         float height,
         IslandFrame frame,
@@ -1295,7 +1295,7 @@ internal sealed class IslandRenderer : IDisposable
         var mainWidth = layout.Width;
         var translation = showTranslation ? line.Translation ?? string.Empty : string.Empty;
         var hasTranslation = !string.IsNullOrWhiteSpace(translation);
-        var translationWidth = translationFont.MeasureText(translation);
+        var translationWidth = hasTranslation ? layout.TranslationWidth : 0f;
         var centerX = clip.MidX;
         var originY = clip.MidY + (hasTranslation ? DoubleLineOriginOffset : 1f);
 
@@ -1306,7 +1306,7 @@ internal sealed class IslandRenderer : IDisposable
 
         var mainX = centerX - mainWidth / 2f;
         var mainBaseline = hasTranslation ? originY - 5f : CenteredBaseline(originY, layout.Runs, mainFonts.Latin) - 2f;
-        DrawKaraokeText(canvas, line, positionMs, mainX, mainBaseline, layout, mainFonts, opacity, highlightEmphasis);
+        DrawKaraokeText(canvas, line, positionMs, mainX, mainBaseline, layout, opacity, highlightEmphasis);
 
         if (hasTranslation)
         {
@@ -1323,11 +1323,10 @@ internal sealed class IslandRenderer : IDisposable
         float x,
         float baseline,
         KaraokeLayout layout,
-        MainFontSet fonts,
         float opacity,
         float highlightEmphasis)
     {
-        var activeWidth = ActiveWidth(line, positionMs, fonts);
+        var activeWidth = ActiveWidth(line, positionMs, layout);
         _idlePaint.Color = new SKColor(108, 109, 114, (byte)(225 * opacity));
         if (activeWidth <= 0f || highlightEmphasis <= 0f)
         {
@@ -1400,10 +1399,31 @@ internal sealed class IslandRenderer : IDisposable
     internal static float ActiveWidth(LyricLine line, double positionMs, SKFont font) =>
         ActiveWidth(line, positionMs, text => font.MeasureText(text));
 
-    private static float ActiveWidth(LyricLine line, double positionMs, MainFontSet fonts)
+    private static float ActiveWidth(LyricLine line, double positionMs, KaraokeLayout layout)
     {
-        var japanese = line.Text.EnumerateRunes().Any(IsKana);
-        return ActiveWidth(line, positionMs, text => MeasureMainText(text, fonts, japanese));
+        if (positionMs <= line.StartMs)
+            return 0f;
+
+        if (layout.Syllables.Length == 0)
+        {
+            var duration = Math.Max(1, line.EndMs - line.StartMs);
+            var p = Math.Clamp((positionMs - line.StartMs) / (double)duration, 0d, 1d);
+            return layout.Width * (float)SmoothStep(p);
+        }
+
+        foreach (var syllable in layout.Syllables)
+        {
+            if (positionMs < syllable.StartMs)
+                return syllable.PrefixWidth;
+
+            if (positionMs <= syllable.EndMs)
+            {
+                var duration = Math.Max(1, syllable.EndMs - syllable.StartMs);
+                var p = Math.Clamp((positionMs - syllable.StartMs) / (double)duration, 0d, 1d);
+                return syllable.PrefixWidth + syllable.Width * (float)SmoothStep(p);
+            }
+        }
+        return layout.Width;
     }
 
     private static float ActiveWidth(LyricLine line, double positionMs, Func<string, float> measure)
@@ -1452,7 +1472,7 @@ internal sealed class IslandRenderer : IDisposable
         canvas.DrawText(subtitle, clip.MidX - subtitleWidth / 2f, originY + 24f, translationFont, _subtitlePaint);
     }
 
-    private static float DesiredWidth(
+    private float DesiredWidth(
         TrackInfo? track,
         LyricLine? line,
         string? status,
@@ -1461,11 +1481,22 @@ internal sealed class IslandRenderer : IDisposable
         bool showTranslation,
         float textScale)
     {
-        var main = line?.Text ?? track?.Title ?? status ?? "等待播放信息";
-        var sub = line is null
-            ? StatusSubtitle(track, status)
-            : showTranslation ? line.Translation ?? string.Empty : string.Empty;
-        var content = Math.Max(MeasureMainText(main, mainFonts), translationFont.MeasureText(sub)) * textScale;
+        float mainWidth;
+        float subWidth;
+        if (line is not null)
+        {
+            var layout = LayoutLine(line, mainFonts);
+            mainWidth = layout.Width;
+            subWidth = showTranslation ? layout.TranslationWidth : 0f;
+        }
+        else
+        {
+            var main = track?.Title ?? status ?? "等待播放信息";
+            var sub = StatusSubtitle(track, status);
+            mainWidth = MeasureMainText(main, mainFonts);
+            subWidth = translationFont.MeasureText(sub);
+        }
+        var content = Math.Max(mainWidth, subWidth) * textScale;
         return Math.Max(content + 146f, 390f);
     }
 
@@ -1533,7 +1564,35 @@ internal sealed class IslandRenderer : IDisposable
         _karaokeLayout2 = _karaokeLayout1;
         _layoutLine1 = line;
         var (runs, width) = LayoutMainText(line.Text, fonts);
-        return _karaokeLayout1 = new KaraokeLayout(runs, BuildGlyphs(runs, line, width), width);
+        var translationWidth = string.IsNullOrWhiteSpace(line.Translation)
+            ? 0f
+            : _translationFont.MeasureText(line.Translation);
+        return _karaokeLayout1 = new KaraokeLayout(
+            runs,
+            BuildGlyphs(runs, line, width),
+            BuildSyllables(line, fonts),
+            width,
+            translationWidth);
+    }
+
+    private static KaraokeSyllable[] BuildSyllables(LyricLine line, MainFontSet fonts)
+    {
+        if (line.Syllables.IsDefaultOrEmpty)
+            return [];
+
+        var japanese = line.Text.EnumerateRunes().Any(IsKana);
+        var syllables = new KaraokeSyllable[line.Syllables.Length];
+        var builder = new StringBuilder(line.Text.Length);
+        var prefixWidth = 0f;
+        for (var i = 0; i < line.Syllables.Length; i++)
+        {
+            var syllable = line.Syllables[i];
+            var width = MeasureMainText(syllable.Text, fonts, japanese);
+            syllables[i] = new KaraokeSyllable(syllable.StartMs, syllable.EndMs, prefixWidth, width);
+            builder.Append(syllable.Text);
+            prefixWidth = MeasureMainText(builder.ToString(), fonts, japanese);
+        }
+        return syllables;
     }
 
     private static List<KaraokeGlyph> BuildGlyphs(List<MainTextRun> runs, LyricLine line, float lineWidth)
@@ -1818,7 +1877,12 @@ internal sealed class IslandRenderer : IDisposable
         _japanese.Dispose();
     }
 
-    private sealed record KaraokeLayout(List<MainTextRun> Runs, List<KaraokeGlyph> Glyphs, float Width) : IDisposable
+    private sealed record KaraokeLayout(
+        List<MainTextRun> Runs,
+        List<KaraokeGlyph> Glyphs,
+        KaraokeSyllable[] Syllables,
+        float Width,
+        float TranslationWidth) : IDisposable
     {
         public void Dispose()
         {
@@ -1826,6 +1890,8 @@ internal sealed class IslandRenderer : IDisposable
                 glyph.Path.Dispose();
         }
     }
+
+    private readonly record struct KaraokeSyllable(long StartMs, long EndMs, float PrefixWidth, float Width);
 
     private sealed record KaraokeGlyph(SKPath Path, float Offset, float Width, int TextOffset)
     {
