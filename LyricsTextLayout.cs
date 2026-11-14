@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -13,6 +14,9 @@ internal sealed class LyricsTextLayout : IDisposable
         public double StartMs { get; set; }
         public double EndMs { get; set; }
         public double SyllableDurationMs { get; set; }
+        public float EffectOffset { get; set; }
+        public float EffectWidth { get; set; } = Width;
+        public int WordGroup { get; init; } = -1;
     }
 
     public List<Glyph> Glyphs { get; } = [];
@@ -22,13 +26,14 @@ internal sealed class LyricsTextLayout : IDisposable
     public SKRect InkBounds { get; }
 
     public LyricsTextLayout(string text, float size, float maxWidth, LyricsFonts fonts,
-        bool bold = true, LyricLine? timing = null, int maxRows = int.MaxValue)
+        bool bold = true, LyricLine? timing = null, int maxRows = int.MaxValue, bool wordEffects = false)
     {
         FontSize = size;
         maxWidth = Math.Max(size, maxWidth);
         var x = 0f;
         var row = 0;
         var textOffset = 0;
+        var nextWordGroup = 0;
         var japanese = text.EnumerateRunes().Any(r => r.Value is >= 0x3040 and <= 0x30ff);
         // Keep Latin words intact; CJK, long words and emoji may wrap at a grapheme boundary.
         foreach (Match token in Regex.Matches(text, @"[^\S\r\n]+|[\r\n]+|[\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]|[^\s\p{IsCJKUnifiedIdeographs}\p{IsHiragana}\p{IsKatakana}]+"))
@@ -58,8 +63,36 @@ internal sealed class LyricsTextLayout : IDisposable
                 x = 0;
             }
             if (row >= maxRows) break;
-            foreach (var part in parts)
+            var partGroups = new int[parts.Count];
+            Array.Fill(partGroups, -1);
+            if (wordEffects)
             {
+                for (var i = 0; i < parts.Count;)
+                {
+                    if (!IsLatinWordElement(parts[i].Text))
+                    {
+                        i++;
+                        continue;
+                    }
+                    var end = i + 1;
+                    var hasLatin = ContainsLatinLetter(parts[i].Text);
+                    while (end < parts.Count && IsLatinWordElement(parts[end].Text))
+                    {
+                        hasLatin |= ContainsLatinLetter(parts[end].Text);
+                        end++;
+                    }
+                    if (hasLatin)
+                    {
+                        var group = nextWordGroup++;
+                        for (var j = i; j < end; j++)
+                            partGroups[j] = group;
+                    }
+                    i = end;
+                }
+            }
+            for (var partIndex = 0; partIndex < parts.Count; partIndex++)
+            {
+                var part = parts[partIndex];
                 var whitespace = string.IsNullOrWhiteSpace(part.Text);
                 if (x + part.Width > maxWidth && x > 0 && !whitespace)
                 {
@@ -70,7 +103,8 @@ internal sealed class LyricsTextLayout : IDisposable
                 if (whitespace && x == 0) continue;
                 if (!whitespace)
                     Glyphs.Add(new Glyph(part.Font.GetTextPath(part.Text, SKPoint.Empty),
-                        x, size + row * size * 1.28f, part.Width, part.Offset));
+                        x, size + row * size * 1.28f, part.Width, part.Offset)
+                    { WordGroup = partGroups[partIndex] });
                 x += part.Width;
                 Width = Math.Max(Width, Math.Min(maxWidth, x));
             }
@@ -102,12 +136,12 @@ internal sealed class LyricsTextLayout : IDisposable
                 Math.Max(inkBounds.Right, bounds.Right), Math.Max(inkBounds.Bottom, bounds.Bottom));
         }
         InkBounds = inkBounds;
-        if (timing is not null) AssignTiming(timing, text);
+        if (timing is not null) AssignTiming(timing, text, wordEffects);
     }
 
-    private void AssignTiming(LyricLine line, string text)
+    private void AssignTiming(LyricLine line, string text, bool wordEffects)
     {
-        var syllables = line.Syllables;
+        var syllables = EffectiveSyllables(line, wordEffects);
         var hasSyllables = !syllables.IsDefaultOrEmpty
             && string.Concat(syllables.Select(s => s.Text)) == text;
         if (!hasSyllables)
@@ -141,7 +175,116 @@ internal sealed class LyricsTextLayout : IDisposable
             first = end;
             offset = endOffset;
         }
+        if (!wordEffects)
+            return;
+
+        for (var start = 0; start < Glyphs.Count;)
+        {
+            var group = Glyphs[start].WordGroup;
+            if (group < 0)
+            {
+                start++;
+                continue;
+            }
+            var baseline = Glyphs[start].Baseline;
+            var end = start + 1;
+            while (end < Glyphs.Count && Glyphs[end].WordGroup == group && Glyphs[end].Baseline == baseline)
+                end++;
+            var startMs = Glyphs[start].StartMs;
+            var endMs = Glyphs[end - 1].EndMs;
+            var durationMs = Math.Max(1, endMs - startMs);
+            var startX = Glyphs[start].X;
+            var width = Math.Max(1f, Glyphs[end - 1].X + Glyphs[end - 1].Width - startX);
+            for (var i = start; i < end; i++)
+            {
+                var glyph = Glyphs[i];
+                glyph.StartMs = startMs;
+                glyph.EndMs = endMs;
+                glyph.SyllableDurationMs = durationMs;
+                glyph.EffectOffset = glyph.X - startX;
+                glyph.EffectWidth = width;
+            }
+            start = end;
+        }
     }
+
+    internal static ImmutableArray<LyricSyllable> EffectiveSyllables(LyricLine line, bool englishWordEffects)
+    {
+        var syllables = line.Syllables;
+        if (!englishWordEffects || syllables.IsDefaultOrEmpty || syllables.Length <= 1)
+            return syllables;
+
+        List<LyricSyllable>? merged = null;
+        var index = 0;
+        while (index < syllables.Length)
+        {
+            var current = syllables[index];
+            var end = index + 1;
+            while (end < syllables.Length
+                   && EndsWithLatinWordRune(current.Text)
+                   && StartsWithLatinWordRune(syllables[end].Text)
+                   && (ContainsLatinLetter(current.Text) || ContainsLatinLetter(syllables[end].Text)))
+            {
+                merged ??= syllables.Take(index).ToList();
+                var next = syllables[end];
+                current = new LyricSyllable(
+                    current.Text + next.Text,
+                    current.StartMs,
+                    Math.Max(current.EndMs, next.EndMs));
+                end++;
+            }
+            merged?.Add(current);
+            index = end;
+        }
+        return merged is null ? syllables : merged.ToImmutableArray();
+    }
+
+    internal static bool IsLatinWordElement(ReadOnlySpan<char> text)
+    {
+        if (text.IsEmpty)
+            return false;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (!IsLatinWordRune(rune))
+                return false;
+        }
+        return true;
+    }
+
+    internal static bool ContainsLatinLetter(ReadOnlySpan<char> text)
+    {
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (IsLatinLetter(rune))
+                return true;
+        }
+        return false;
+    }
+
+    internal static bool IsLatinWordRune(Rune rune) =>
+        !Rune.IsWhiteSpace(rune) && !IsCjk(rune);
+
+    internal static bool IsLatinLetter(Rune rune) =>
+        rune.Value is (>= 'A' and <= 'Z')
+            or (>= 'a' and <= 'z')
+            or (>= 0x00C0 and <= 0x024F and not 0x00D7 and not 0x00F7)
+            or (>= 0x1E00 and <= 0x1EFF);
+
+    internal static bool IsCjk(Rune rune) =>
+        rune.Value is >= 0x2E80 and <= 0x9FFF
+            or >= 0xAC00 and <= 0xD7AF
+            or >= 0xF900 and <= 0xFAFF
+            or >= 0xFE10 and <= 0xFE4F
+            or >= 0xFF00 and <= 0xFFEF
+            or >= 0x20000 and <= 0x323AF;
+
+    private static bool StartsWithLatinWordRune(ReadOnlySpan<char> text) =>
+        Rune.DecodeFromUtf16(text, out var rune, out _) == System.Buffers.OperationStatus.Done
+        && IsLatinWordRune(rune);
+
+    private static bool EndsWithLatinWordRune(ReadOnlySpan<char> text) =>
+        Rune.DecodeLastFromUtf16(text, out var rune, out _) == System.Buffers.OperationStatus.Done
+        && IsLatinWordRune(rune);
 
     public void Draw(SKCanvas canvas, float x, float y, SKPaint paint)
     {

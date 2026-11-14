@@ -28,12 +28,17 @@ public sealed class OverlayWindow : Window
     private readonly IslandControl _island;
     private readonly Func<TrackInfo, int, bool> _trackOffsetChanged;
     private readonly Func<PlaybackCommand, CancellationToken, Task<string?>> _controlPlayback;
+    private readonly Action _showLyricsWindow;
+    private readonly Action _showBanner;
     private readonly CancellationTokenSource _lifetime = new();
     private PointerPressedEventArgs? _pressArgs;
     private Point _pressPoint;
+    private IslandSide? _pressedSide;
+    private string? _pressedTrackId;
     private bool _dragged;
     private IDisposable? _pendingClick;
     private bool _playbackBusy;
+    private StandardCursorType? _cursorType;
     private readonly MenuItem _hideItem;
     private readonly MenuItem _bannerItem;
     private readonly MenuItem _earlierTrackOffsetItem;
@@ -60,6 +65,8 @@ public sealed class OverlayWindow : Window
         _settings = SettingsStore.Normalize(settings);
         _trackOffsetChanged = trackOffsetChanged;
         _controlPlayback = controlPlayback;
+        _showLyricsWindow = showLyricsWindow;
+        _showBanner = showBanner;
         Title = "词岛";
         Width = 960;
         Height = CalculateLogicalHeight(_settings.ScalePercent);
@@ -77,7 +84,14 @@ public sealed class OverlayWindow : Window
         _island.PointerPressed += OnIslandPressed;
         _island.PointerMoved += OnIslandMoved;
         _island.PointerReleased += OnIslandReleased;
-        _island.PointerCaptureLost += (_, _) => _pressArgs = null;
+        _island.PointerExited += OnIslandExited;
+        _island.PointerCaptureLost += (_, _) =>
+        {
+            _pressArgs = null;
+            _pressedSide = null;
+            _pressedTrackId = null;
+            _island.SetPressedSide(null);
+        };
         _island.PointerWheelChanged += OnIslandWheel;
 
         _hideItem = CreateContextMenuItem(HideLabel(_settings.TemporaryHideSeconds));
@@ -167,6 +181,7 @@ public sealed class OverlayWindow : Window
             _lifetime.Dispose();
             Screens.Changed -= ScreensChanged;
             _nativeOverlay?.Dispose();
+            _island.Cursor?.Dispose();
             _island.Dispose();
         };
     }
@@ -179,6 +194,7 @@ public sealed class OverlayWindow : Window
         _hideItem.Header = HideLabel(_settings.TemporaryHideSeconds);
         RefreshTrackOffsetMenu();
         UpdateSurfaceRegions(_island.PillBounds);
+        UpdateCursor(_island.Pointer);
         var geometryChanged = previous.WidthPercent != _settings.WidthPercent
             || previous.ScalePercent != _settings.ScalePercent;
         if (IsVisible && geometryChanged)
@@ -209,34 +225,59 @@ public sealed class OverlayWindow : Window
         _pendingClick = null;
     }
 
+    private void UpdateCursor(Point point)
+    {
+        var cursor = _island.IsSideActionEnabledAt(point) ? StandardCursorType.Hand : StandardCursorType.Arrow;
+        if (_cursorType != cursor)
+        {
+            var previous = _island.Cursor;
+            _island.Cursor = new Cursor(cursor);
+            _cursorType = cursor;
+            previous?.Dispose();
+        }
+    }
+
     private void OnIslandPressed(object? sender, PointerPressedEventArgs args)
     {
         CancelPendingClick();
         if (args.GetCurrentPoint(_island).Properties.PointerUpdateKind != PointerUpdateKind.LeftButtonPressed)
             return;
+        var point = args.GetPosition(_island);
+        _island.SetPointer(point);
+        UpdateCursor(point);
         args.Handled = true;
-        if (args.ClickCount == 2)
+        var pressedSide = _island.HitTestSideIcon(point);
+        if (pressedSide is null && args.ClickCount == 2)
         {
             _pressArgs = null;
+            _pressedSide = null;
+            _pressedTrackId = null;
+            _island.SetPressedSide(null);
             _ = HideTemporarilyAsync();
             return;
         }
         _pressArgs = args;
-        _pressPoint = args.GetPosition(_island);
+        _pressPoint = point;
+        _pressedSide = pressedSide;
+        _pressedTrackId = _store.Snapshot.Track?.Id;
         _dragged = false;
+        _island.SetPressedSide(pressedSide);
         args.Pointer.Capture(_island);
     }
 
     private void OnIslandMoved(object? sender, PointerEventArgs args)
     {
+        var point = args.GetPosition(_island);
+        _island.SetPointer(point);
+        UpdateCursor(point);
         if (_pressArgs is not { } press || _dragged)
             return;
-        var point = args.GetPosition(_island);
         var tapSize = Application.Current!.PlatformSettings!.GetTapSize(args.Pointer.Type);
         if (Math.Abs(point.X - _pressPoint.X) <= tapSize.Width / 2
             && Math.Abs(point.Y - _pressPoint.Y) <= tapSize.Height / 2)
             return;
         _dragged = true;
+        _island.SetPressedSide(null);
         if (!_settings.LockPosition)
         {
             _pressArgs = null;
@@ -249,10 +290,26 @@ public sealed class OverlayWindow : Window
     {
         if (args.InitialPressMouseButton != MouseButton.Left || _pressArgs is null)
             return;
+        var point = args.GetPosition(_island);
+        var pressedSide = _pressedSide;
+        var pressedTrackId = _pressedTrackId;
         _pressArgs = null;
+        _pressedSide = null;
+        _pressedTrackId = null;
+        _island.SetPointer(point);
+        _island.SetPressedSide(null);
+        UpdateCursor(point);
         args.Pointer.Capture(null);
         args.Handled = true;
-        if (_dragged || !IslandRenderer.HitTest(_island.PillBounds, args.GetPosition(_island)))
+        if (_dragged)
+            return;
+        if (pressedSide is { } side)
+        {
+            if (_island.HitTestSideIcon(point) == side)
+                ExecuteSideAction(_island.GetSideAction(side), pressedTrackId);
+            return;
+        }
+        if (!IslandRenderer.HitTest(_island.PillBounds, point) || _island.HitTestSideIcon(point) is not null)
             return;
         var trackId = _store.Snapshot.Track?.Id;
         // Wait for the system's double-click interval so hiding never also pauses playback.
@@ -261,6 +318,46 @@ public sealed class OverlayWindow : Window
             _pendingClick = null;
             _ = SendPlaybackAsync(PlaybackAction.PlayPause, trackId);
         }, Application.Current!.PlatformSettings!.GetDoubleTapTime(args.Pointer.Type));
+    }
+
+    private void ExecuteSideAction(IslandIconAction action, string? pressedTrackId)
+    {
+        var snapshot = _store.Snapshot;
+        switch (action)
+        {
+            case IslandIconAction.Favorite:
+                if (pressedTrackId is not null && snapshot.Track?.Id == pressedTrackId && snapshot.Controls.CanFavorite)
+                    _ = SendPlaybackAsync(PlaybackAction.Favorite, pressedTrackId, snapshot.Controls.IsFavorite == true ? 0 : 1);
+                break;
+            case IslandIconAction.LyricsWindow:
+                _showLyricsWindow();
+                break;
+            case IslandIconAction.PlayPause:
+                if (pressedTrackId is not null && snapshot.Track?.Id == pressedTrackId && snapshot.Controls.CanPlayPause)
+                    _ = SendPlaybackAsync(PlaybackAction.PlayPause, pressedTrackId, collapseSidesOnPause: false);
+                break;
+            case IslandIconAction.Previous:
+                if (pressedTrackId is not null && snapshot.Track?.Id == pressedTrackId && snapshot.Controls.CanPrevious)
+                    _ = SendPlaybackAsync(PlaybackAction.Previous, pressedTrackId);
+                break;
+            case IslandIconAction.Next:
+                if (pressedTrackId is not null && snapshot.Track?.Id == pressedTrackId && snapshot.Controls.CanNext)
+                    _ = SendPlaybackAsync(PlaybackAction.Next, pressedTrackId);
+                break;
+            case IslandIconAction.Banner:
+                if (snapshot.Track is not null)
+                    _showBanner();
+                break;
+            case IslandIconAction.TemporaryHide:
+                _ = HideTemporarilyAsync();
+                break;
+        }
+    }
+
+    private void OnIslandExited(object? sender, PointerEventArgs args)
+    {
+        _island.SetPointer(new Point(-1, -1));
+        UpdateCursor(new Point(-1, -1));
     }
 
     private void OnIslandWheel(object? sender, PointerWheelEventArgs args)
@@ -273,7 +370,7 @@ public sealed class OverlayWindow : Window
             _store.Snapshot.Track?.Id);
     }
 
-    private async Task SendPlaybackAsync(PlaybackAction action, string? trackId)
+    private async Task SendPlaybackAsync(PlaybackAction action, string? trackId, double value = 0, bool collapseSidesOnPause = true)
     {
         var snapshot = _store.Snapshot;
         if (_closed || _playbackBusy || _island.TrackSwitchInProgress || snapshot.Track is null || snapshot.Track.Id != trackId)
@@ -283,20 +380,22 @@ public sealed class OverlayWindow : Window
             PlaybackAction.PlayPause => snapshot.Controls.CanPlayPause,
             PlaybackAction.Previous => snapshot.Controls.CanPrevious,
             PlaybackAction.Next => snapshot.Controls.CanNext,
+            PlaybackAction.Favorite => snapshot.Controls.CanFavorite,
             _ => false
         };
         if (!allowed)
             return;
         _playbackBusy = true;
+        _island.SetBusy(true);
         var pausing = action == PlaybackAction.PlayPause && snapshot.IsPlaying;
         var switching = action is PlaybackAction.Previous or PlaybackAction.Next;
         if (pausing)
-            _island.RetainOnIslandPause(trackId!);
+            _island.RetainOnIslandPause(trackId!, collapseSidesOnPause);
         if (switching)
             _island.BeginTrackSwitch(action == PlaybackAction.Next ? 1 : -1, snapshot);
         try
         {
-            var error = await _controlPlayback(new PlaybackCommand(action, TrackId: trackId), _lifetime.Token);
+            var error = await _controlPlayback(new PlaybackCommand(action, value, trackId), _lifetime.Token);
             if (switching) _island.FinishTrackSwitch(error is null);
             if (error is not null)
             {
@@ -315,7 +414,15 @@ public sealed class OverlayWindow : Window
             if (pausing) _island.CancelIslandPause();
             Console.Error.WriteLine($"[island] 播放控制失败：{exception.Message}");
         }
-        finally { _playbackBusy = false; }
+        finally
+        {
+            _playbackBusy = false;
+            if (!_closed)
+            {
+                _island.SetBusy(false);
+                UpdateCursor(_island.Pointer);
+            }
+        }
     }
 
     private async Task HideTemporarilyAsync()
@@ -456,6 +563,7 @@ public sealed class IslandControl : Control, IDisposable
     private int _lyricsOffsetMs;
     private ImmutableDictionary<string, int>? _trackOffsetsMs;
     private bool _showTranslation = true;
+    private bool _englishWordEffects;
     private bool _showIsland = true;
     private PausedDisplayMode _pausedDisplay;
     private bool _inactive;
@@ -463,6 +571,7 @@ public sealed class IslandControl : Control, IDisposable
     private bool _delayedHidePending;
     private string? _islandPauseTrackId;
     private bool _islandPauseObserved;
+    private bool _islandPauseCollapseSides = true;
     private double _sidesProgress = 1d;
     private double _sidesFrom = 1d;
     private bool _sidesShown = true;
@@ -483,20 +592,130 @@ public sealed class IslandControl : Control, IDisposable
     private long _switchReturningAt;
     private Rect _pillBounds;
     private PlaybackSnapshot? _renderedSnapshot;
+    private Point _pointer = new(-1, -1);
+    private IslandIconAction _leftIconAction = IslandIconAction.LyricsWindow;
+    private IslandIconAction _rightIconAction = IslandIconAction.Favorite;
+    private IslandSide? _pressedSide;
+    private bool _playbackBusy;
+    private SideIconAnimator _leftIcon = new() { Enabled = 1d };
+    private SideIconAnimator _rightIcon = new() { Enabled = 1d };
+    private bool _sideIconsTransitioning;
+    private long _lastRenderTimestamp;
     private bool _animationFrameQueued;
     private readonly FrameScheduler _frameScheduler = new();
     private IDisposable? _idleFrame;
     private bool _disposed;
 
     internal Rect PillBounds => _pillBounds;
+    internal Point Pointer => _pointer;
     internal bool TrackSwitchInProgress => _switchOutgoing is not null;
     internal event Action<Rect>? PillBoundsChanged;
 
     public IslandControl(PlaybackStore store)
     {
         _store = store;
+        _store.Changed += OnPlaybackChanged;
         AttachedToVisualTree += (_, _) => QueueAnimationFrame();
     }
+
+    private void OnPlaybackChanged(object? sender, EventArgs args) =>
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (!_disposed)
+                WakeAnimation();
+        });
+
+    private void WakeAnimation()
+    {
+        if (_disposed)
+            return;
+        if (_idleFrame is not null)
+        {
+            _idleFrame.Dispose();
+            _idleFrame = null;
+            _animationFrameQueued = false;
+        }
+        InvalidateVisual();
+        QueueAnimationFrame();
+    }
+
+    internal void SetPointer(Point point)
+    {
+        if (_pointer == point)
+            return;
+        _pointer = point;
+        WakeAnimation();
+    }
+
+    internal void SetPressedSide(IslandSide? side)
+    {
+        if (_pressedSide == side)
+            return;
+        _pressedSide = side;
+        WakeAnimation();
+    }
+
+    internal void SetBusy(bool busy)
+    {
+        if (_playbackBusy == busy)
+            return;
+        _playbackBusy = busy;
+        WakeAnimation();
+    }
+
+    internal IslandIconAction GetSideAction(IslandSide side) =>
+        side == IslandSide.Left ? _leftIconAction : _rightIconAction;
+
+    internal IslandSide? HitTestSideIcon(Point point)
+    {
+        var snapshot = _store.Snapshot;
+        if (!CanHoverSides(snapshot))
+            return null;
+        if (CanHoverAction(_leftIconAction, snapshot)
+            && IslandRenderer.HitTestAvatar(_pillBounds, _scale, _capsuleProgress, point))
+            return IslandSide.Left;
+        if (CanHoverAction(_rightIconAction, snapshot)
+            && IslandRenderer.HitTestAlbum(_pillBounds, _scale, _capsuleProgress, point))
+            return IslandSide.Right;
+        return null;
+    }
+
+    internal bool IsSideActionEnabledAt(Point point) =>
+        HitTestSideIcon(point) is { } side
+        && IsActionEnabled(GetSideAction(side), _store.Snapshot, _playbackBusy);
+
+    private bool CanHoverSides(PlaybackSnapshot snapshot) =>
+        !PlaybackStore.RequiresAttention(snapshot.Status)
+        && _capsuleShown && _sidesShown
+        && _capsuleProgress > 0.5d && _sidesProgress > 0.5d
+        && !TrackSwitchInProgress;
+
+    private static bool CanHoverAction(IslandIconAction action, PlaybackSnapshot snapshot) => action switch
+    {
+        IslandIconAction.None => false,
+        IslandIconAction.LyricsWindow or IslandIconAction.TemporaryHide => true,
+        _ => snapshot.Track is not null
+    };
+
+    private static bool IsActionEnabled(IslandIconAction action, PlaybackSnapshot snapshot, bool busy) => action switch
+    {
+        IslandIconAction.None => false,
+        IslandIconAction.Favorite => !busy && snapshot.Track is not null && snapshot.Controls.CanFavorite,
+        IslandIconAction.LyricsWindow => true,
+        IslandIconAction.PlayPause => !busy && snapshot.Track is not null && snapshot.Controls.CanPlayPause,
+        IslandIconAction.Previous => !busy && snapshot.Track is not null && snapshot.Controls.CanPrevious,
+        IslandIconAction.Next => !busy && snapshot.Track is not null && snapshot.Controls.CanNext,
+        IslandIconAction.Banner => snapshot.Track is not null,
+        IslandIconAction.TemporaryHide => true,
+        _ => false
+    };
+
+    private static bool IsActionActive(IslandIconAction action, PlaybackSnapshot snapshot) => action switch
+    {
+        IslandIconAction.Favorite => snapshot.Controls.IsFavorite == true,
+        IslandIconAction.PlayPause => snapshot.IsPlaying,
+        _ => false
+    };
 
     private void QueueAnimationFrame()
     {
@@ -505,7 +724,7 @@ public sealed class IslandControl : Control, IDisposable
         _animationFrameQueued = true;
         var snapshot = _store.Snapshot;
         if ((!_showIsland || !snapshot.IsPlaying) && _outgoing is null && !_capsuleTransitioning && !_sidesTransitioning
-            && !_lyricsTransitioning
+            && !_lyricsTransitioning && !_sideIconsTransitioning
             && !TrackSwitchInProgress
             && !_delayedHidePending && ReferenceEquals(snapshot, _renderedSnapshot))
         {
@@ -527,7 +746,7 @@ public sealed class IslandControl : Control, IDisposable
 
         var snapshot = _store.Snapshot;
         if ((_showIsland && snapshot.IsPlaying) || _outgoing is not null || _capsuleTransitioning || _sidesTransitioning
-            || _lyricsTransitioning || _delayedHidePending
+            || _lyricsTransitioning || _sideIconsTransitioning || _delayedHidePending
             || TrackSwitchInProgress
             || !ReferenceEquals(snapshot, _renderedSnapshot))
             InvalidateVisual();
@@ -540,6 +759,9 @@ public sealed class IslandControl : Control, IDisposable
         _lyricsOffsetMs = settings.LyricsOffsetMs;
         _trackOffsetsMs = settings.EnableTrackOffsets ? settings.TrackOffsetsMs : null;
         _showTranslation = settings.ShowTranslation;
+        _englishWordEffects = settings.EnglishWordEffects;
+        _leftIconAction = settings.LeftIconAction;
+        _rightIconAction = settings.RightIconAction;
         _showIsland = settings.ShowIsland;
         if (_renderedSnapshot is null)
         {
@@ -548,20 +770,14 @@ public sealed class IslandControl : Control, IDisposable
         }
         _pausedDisplay = settings.PausedDisplay;
         _renderer.SetBackgroundOpacity(settings.BackgroundOpacityPercent);
-        if (_idleFrame is not null)
-        {
-            _idleFrame.Dispose();
-            _idleFrame = null;
-            _animationFrameQueued = false;
-            QueueAnimationFrame();
-        }
-        InvalidateVisual();
+        WakeAnimation();
     }
 
-    internal void RetainOnIslandPause(string trackId)
+    internal void RetainOnIslandPause(string trackId, bool collapseSides = true)
     {
         _islandPauseTrackId = trackId;
         _islandPauseObserved = false;
+        _islandPauseCollapseSides = collapseSides;
         InvalidateVisual();
     }
 
@@ -575,13 +791,14 @@ public sealed class IslandControl : Control, IDisposable
     {
         _islandPauseTrackId = null;
         _islandPauseObserved = false;
+        _islandPauseCollapseSides = true;
     }
 
     internal void BeginTrackSwitch(int direction, PlaybackSnapshot snapshot)
     {
         if (_renderedFrame is not { Track: not null } outgoing || outgoing.Track.Id != snapshot.Track!.Id)
             return;
-        _switchOutgoing = outgoing with { TrackSwitch = null };
+        _switchOutgoing = outgoing with { TrackSwitch = null, LeftIcon = default, RightIcon = default };
         _switchDirection = direction;
         _switchPositionMs = snapshot.ReportedPositionMs;
         _switchRequestedAt = Stopwatch.GetTimestamp();
@@ -717,7 +934,7 @@ public sealed class IslandControl : Control, IDisposable
             _capsuleFrom, capsuleShown ? 1d : 0d, capsuleSeconds);
         _capsuleTransitioning = capsuleSeconds < IslandRenderer.CapsuleTransitionDuration;
 
-        var sidesShown = !retainedPause;
+        var sidesShown = !retainedPause || !_islandPauseCollapseSides;
         if (sidesShown != _sidesShown)
         {
             _sidesShown = sidesShown;
@@ -744,7 +961,7 @@ public sealed class IslandControl : Control, IDisposable
             _lyricsFrom, snapshot.IsPlaying ? 1d : 0d, lyricsSeconds);
         _lyricsTransitioning = lyricsSeconds < IslandRenderer.CapsuleTransitionDuration;
 
-        var frame = new IslandFrame(
+        var baseFrame = new IslandFrame(
             requiresAttention ? null : track,
             requiresAttention ? null : _line,
             requiresAttention ? null : _outgoing,
@@ -757,17 +974,91 @@ public sealed class IslandControl : Control, IDisposable
             _showTranslation,
             _sidesProgress,
             _lyricsEmphasis,
-            trackSwitch);
-        _renderedFrame = frame;
-        var fullPillBounds = _renderer.CalculatePillBounds((float)Bounds.Width, (float)Bounds.Height, frame);
+            trackSwitch,
+            _englishWordEffects);
+        var fullPillBounds = _renderer.CalculatePillBounds((float)Bounds.Width, (float)Bounds.Height, baseFrame);
         var pillBounds = IslandRenderer.ScalePillBounds(fullPillBounds, _capsuleProgress);
         if (pillBounds != _pillBounds)
         {
             _pillBounds = pillBounds;
             PillBoundsChanged?.Invoke(pillBounds);
         }
+
+        var dt = _lastRenderTimestamp == 0
+            ? 1d / 60d
+            : Math.Clamp(Stopwatch.GetElapsedTime(_lastRenderTimestamp, now).TotalSeconds, 0d, 0.05d);
+        _lastRenderTimestamp = now;
+        var canHoverSides = !requiresAttention && capsuleShown && sidesShown
+            && _capsuleProgress > 0.5d && _sidesProgress > 0.5d && trackSwitch is null;
+
+        var leftHovered = canHoverSides && CanHoverAction(_leftIconAction, snapshot)
+            && IslandRenderer.HitTestAvatar(pillBounds, _scale, _capsuleProgress, _pointer);
+        var leftEnabled = IsActionEnabled(_leftIconAction, snapshot, _playbackBusy);
+        var leftActive = IsActionActive(_leftIconAction, snapshot);
+        var leftPressed = _pressedSide == IslandSide.Left && leftHovered && leftEnabled;
+        var leftState = _leftIcon.Step(_leftIconAction, leftHovered, leftActive, leftPressed, leftEnabled, dt);
+
+        var rightHovered = canHoverSides && CanHoverAction(_rightIconAction, snapshot)
+            && IslandRenderer.HitTestAlbum(pillBounds, _scale, _capsuleProgress, _pointer);
+        var rightEnabled = IsActionEnabled(_rightIconAction, snapshot, _playbackBusy);
+        var rightActive = IsActionActive(_rightIconAction, snapshot);
+        var rightPressed = _pressedSide == IslandSide.Right && rightHovered && rightEnabled;
+        var rightState = _rightIcon.Step(_rightIconAction, rightHovered, rightActive, rightPressed, rightEnabled, dt);
+
+        _sideIconsTransitioning = leftState.InTransition || rightState.InTransition;
+
+        var frame = baseFrame with
+        {
+            LeftIcon = leftState,
+            RightIcon = rightState
+        };
+        _renderedFrame = frame;
         context.Custom(new IslandDrawOperation(
             new Rect(Bounds.Size), _renderer, frame, fullPillBounds, pillBounds));
+    }
+
+    private struct SideIconAnimator
+    {
+        public double Hover;
+        public double Active;
+        public double Pressed;
+        public double Enabled;
+        public IslandIconAction DisplayedAction;
+
+        public IslandSideIconState Step(
+            IslandIconAction configuredAction,
+            bool hovered,
+            bool active,
+            bool pressed,
+            bool enabled,
+            double dt)
+        {
+            var effectiveHovered = hovered && configuredAction != IslandIconAction.None;
+            if (configuredAction != IslandIconAction.None)
+                DisplayedAction = configuredAction;
+            Hover = Approach(Hover, effectiveHovered ? 1d : 0d, dt, 16d);
+            if (Hover <= 0.001d && !effectiveHovered)
+            {
+                Active = active ? 1d : 0d;
+                Enabled = enabled ? 1d : 0d;
+                Pressed = 0d;
+                DisplayedAction = configuredAction;
+            }
+            else
+            {
+                Active = Approach(Active, active ? 1d : 0d, dt, 16d);
+                Enabled = Approach(Enabled, enabled ? 1d : 0d, dt, 12d);
+                Pressed = Approach(Pressed, pressed ? 1d : 0d, dt, 20d);
+            }
+            var action = Hover > 0.001d ? DisplayedAction : configuredAction;
+            return new IslandSideIconState(action, Hover, Active, Pressed, Enabled);
+        }
+    }
+
+    private static double Approach(double value, double target, double dt, double speed)
+    {
+        var next = value + (target - value) * (1d - Math.Exp(-dt * speed));
+        return Math.Abs(next - target) < 0.0005d ? target : next;
     }
 
     internal double CurrentPosition(PlaybackSnapshot snapshot)
@@ -822,6 +1113,7 @@ public sealed class IslandControl : Control, IDisposable
     public void Dispose()
     {
         _disposed = true;
+        _store.Changed -= OnPlaybackChanged;
         _idleFrame?.Dispose();
         _frameScheduler.Dispose();
         // Render operations may still be queued on Avalonia's compositor thread.
@@ -856,6 +1148,26 @@ internal sealed class IslandDrawOperation(
     public void Dispose() { }
 }
 
+internal enum IslandSide
+{
+    Left,
+    Right
+}
+
+internal readonly record struct IslandSideIconState(
+    IslandIconAction Action = IslandIconAction.None,
+    double Hover = 0d,
+    double Active = 0d,
+    double Pressed = 0d,
+    double Enabled = 1d)
+{
+    public bool InTransition =>
+        IsTransitioning(Hover)
+        || (Hover > 0.001d && (IsTransitioning(Active) || IsTransitioning(Pressed) || IsTransitioning(Enabled)));
+
+    private static bool IsTransitioning(double value) => value is > 0.001d and < 0.999d;
+}
+
 internal sealed record IslandFrame(
     TrackInfo? Track,
     LyricLine? Line,
@@ -869,8 +1181,35 @@ internal sealed record IslandFrame(
     bool ShowTranslation = true,
     double SidesProgress = 1d,
     double? LyricsEmphasis = null,
-    IslandTrackSwitch? TrackSwitch = null)
+    IslandTrackSwitch? TrackSwitch = null,
+    bool EnglishWordEffects = false)
 {
+    public IslandSideIconState LeftIcon { get; init; }
+    public IslandSideIconState RightIcon { get; init; }
+    public double FavoriteHover
+    {
+        get => RightIcon.Hover;
+        init => RightIcon = RightIcon with
+        {
+            Action = RightIcon.Action == IslandIconAction.None && value > 0d ? IslandIconAction.Favorite : RightIcon.Action,
+            Hover = value
+        };
+    }
+    public double FavoriteActive
+    {
+        get => RightIcon.Active;
+        init => RightIcon = RightIcon with { Active = value };
+    }
+    public double FavoritePressed
+    {
+        get => RightIcon.Pressed;
+        init => RightIcon = RightIcon with { Pressed = value };
+    }
+    public double FavoriteEnabled
+    {
+        get => RightIcon.Enabled;
+        init => RightIcon = RightIcon with { Enabled = value };
+    }
     internal float HighlightEmphasis => (float)Math.Clamp(LyricsEmphasis ?? (IsPlaying ? 1d : 0d), 0d, 1d);
     internal float TextScale => .8f + .2f * HighlightEmphasis;
 }
@@ -930,6 +1269,8 @@ internal sealed class IslandRenderer : IDisposable
     private readonly SKPaint _edgeBloom = Paint(new SKColor(255, 255, 255, 78), 3.8f);
     private readonly SKPaint _titlePaint = Paint(new SKColor(242, 243, 244));
     private readonly SKPaint _subtitlePaint = Paint(new SKColor(145, 146, 151));
+    private readonly SKPaint _favoritePaint = Paint(SKColors.White);
+    private readonly SKPath _favoritePath = new();
     private readonly SKBitmap? _icon;
     private TrackInfo? _albumTrack;
     private SKImage? _album;
@@ -941,6 +1282,7 @@ internal sealed class IslandRenderer : IDisposable
     private KaraokeLayout? _karaokeLayout1;
     private LyricLine? _layoutLine2;
     private KaraokeLayout? _karaokeLayout2;
+    private bool _layoutWordEffects;
 
     public IslandRenderer()
     {
@@ -1032,7 +1374,7 @@ internal sealed class IslandRenderer : IDisposable
             var p = Math.Clamp(frame.TransitionSeconds / 0.11, 0d, 1d);
             DrawLineBlock(canvas, frame.Outgoing, frame.PositionMs, clip, mainFonts, _translationFont,
                 1f - 0.25f * (float)EaseOutCubic(p), (float)(1d - EaseOutCubic(p)), frame.ShowTranslation,
-                frame.HighlightEmphasis);
+                frame.HighlightEmphasis, frame.EnglishWordEffects);
         }
 
         var incomingStart = frame.Outgoing is null ? 0d : 0.30d;
@@ -1043,7 +1385,7 @@ internal sealed class IslandRenderer : IDisposable
                 : Math.Clamp((frame.TransitionSeconds - incomingStart) / 0.60d, 0d, 1d);
             var scale = frame.Outgoing is null ? 1f : (float)(0.75d + 0.25d * Spring(p));
             DrawLineBlock(canvas, frame.Line, frame.PositionMs, clip, mainFonts, _translationFont,
-                scale, (float)EaseOutCubic(p), frame.ShowTranslation, frame.HighlightEmphasis);
+                scale, (float)EaseOutCubic(p), frame.ShowTranslation, frame.HighlightEmphasis, frame.EnglishWordEffects);
         }
         else if (frame.Line is null)
         {
@@ -1155,6 +1497,29 @@ internal sealed class IslandRenderer : IDisposable
         return new Rect(bounds.Center.X - width / 2d, bounds.Center.Y - height / 2d, width, height);
     }
 
+    internal static Rect AvatarBounds(Rect pillBounds, double scale, double capsuleProgress = 1d)
+    {
+        var s = Math.Clamp(scale, 0.5d, 2d) * Math.Clamp(capsuleProgress, 0d, 1d);
+        return new Rect(pillBounds.Left + 18d * s, pillBounds.Center.Y - 24d * s, 48d * s, 48d * s);
+    }
+
+    internal static bool HitTestAvatar(Rect pillBounds, double scale, double capsuleProgress, Point point) =>
+        pillBounds.Width > 0d && pillBounds.Height > 0d
+        && AvatarBounds(pillBounds, scale, capsuleProgress).Contains(point);
+
+    internal static Rect AlbumBounds(Rect pillBounds, double scale, double capsuleProgress = 1d)
+    {
+        var s = Math.Clamp(scale, 0.5d, 2d) * Math.Clamp(capsuleProgress, 0d, 1d);
+        return new Rect(pillBounds.Right - 62d * s, pillBounds.Center.Y - 22d * s, 44d * s, 44d * s);
+    }
+
+    internal static bool HitTestAlbum(Rect pillBounds, double scale, double capsuleProgress, Point point) =>
+        pillBounds.Width > 0d && pillBounds.Height > 0d
+        && AlbumBounds(pillBounds, scale, capsuleProgress).Contains(point);
+
+    internal static bool HitTestFavorite(Rect pillBounds, double scale, double capsuleProgress, Point point) =>
+        HitTestAlbum(pillBounds, scale, capsuleProgress, point);
+
     private SKRect PillRect(
         float width,
         float height,
@@ -1164,10 +1529,10 @@ internal sealed class IslandRenderer : IDisposable
     {
         var settledWidth = DesiredWidth(
             frame.Track, frame.Line, frame.Status, mainFonts, translationFont, frame.ShowTranslation,
-            frame.TextScale);
+            frame.TextScale, frame.EnglishWordEffects);
         var outgoingWidth = DesiredWidth(
             frame.Track, frame.Outgoing, frame.Status, mainFonts, translationFont, frame.ShowTranslation,
-            frame.TextScale);
+            frame.TextScale, frame.EnglishWordEffects);
         var sideInset = (float)(86d * (1d - Math.Clamp(frame.SidesProgress, 0d, 1d)));
         var pillWidth = Math.Min(width - 16f,
             AnimatedWidth(outgoingWidth, settledWidth, frame.TransitionSeconds)) - sideInset;
@@ -1207,22 +1572,249 @@ internal sealed class IslandRenderer : IDisposable
             ? 0d
             : Stopwatch.GetElapsedTime(_artistTrackAt).TotalSeconds;
         var avatar = ArtistAvatarState(avatarAge, _artistImages.Count);
-        DrawAvatar(canvas, avatarRect, avatar.Index, avatar.Opacity);
+        DrawAvatarOrAction(canvas, frame.LeftIcon, avatarRect, avatar.Index, avatar.Opacity);
 
         EnsureAlbum(frame.Track);
         var albumRect = SKRect.Create(pill.Right - 62f, pill.MidY - 22f, 44f, 44f);
-        canvas.Save();
-        canvas.ClipRoundRect(new SKRoundRect(albumRect, 5f), SKClipOperation.Intersect, true);
-        if (_album is not null)
+        DrawAlbumOrAction(canvas, frame.RightIcon, albumRect);
+    }
+
+    private void DrawAvatarOrAction(
+        SKCanvas canvas,
+        IslandSideIconState state,
+        SKRect avatarRect,
+        int index,
+        float opacity)
+    {
+        var hover = state.Action == IslandIconAction.None ? 0f : (float)Math.Clamp(state.Hover, 0d, 1d);
+        var avatarProgress = 1f - hover;
+        if (avatarProgress > 0.001f)
         {
-            canvas.DrawImage(_album, albumRect,
-                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear), _imagePaint);
+            var avatarScale = 0.78f + 0.22f * avatarProgress;
+            canvas.Save();
+            if (avatarProgress < 0.999f)
+            {
+                canvas.Translate(avatarRect.MidX, avatarRect.MidY);
+                canvas.Scale(avatarScale);
+                canvas.Translate(-avatarRect.MidX, -avatarRect.MidY);
+            }
+            DrawAvatar(canvas, avatarRect, index, opacity * avatarProgress);
+            canvas.Restore();
+        }
+
+        if (hover > 0.001f)
+            DrawSideActionButton(canvas, avatarRect, state, hover);
+    }
+
+    private void DrawAlbumOrAction(SKCanvas canvas, IslandSideIconState state, SKRect albumRect)
+    {
+        var hover = state.Action == IslandIconAction.None ? 0f : (float)Math.Clamp(state.Hover, 0d, 1d);
+        var albumProgress = 1f - hover;
+        if (albumProgress > 0.001f)
+        {
+            var albumScale = 0.78f + 0.22f * albumProgress;
+            var cornerRadius = Lerp(albumRect.Width / 2f, 5f, albumProgress);
+            var albumAlpha = (byte)Math.Round(255f * albumProgress);
+            canvas.Save();
+            if (albumProgress < 0.999f)
+            {
+                canvas.Translate(albumRect.MidX, albumRect.MidY);
+                canvas.Scale(albumScale);
+                canvas.Translate(-albumRect.MidX, -albumRect.MidY);
+            }
+            canvas.ClipRoundRect(new SKRoundRect(albumRect, cornerRadius), SKClipOperation.Intersect, true);
+            if (_album is not null)
+            {
+                _imagePaint.Color = new SKColor(255, 255, 255, albumAlpha);
+                canvas.DrawImage(_album, albumRect,
+                    new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear), _imagePaint);
+                _imagePaint.Color = SKColors.White;
+            }
+            else
+            {
+                _placeholderPaint.Color = new SKColor(38, 42, 46, albumAlpha);
+                canvas.DrawRect(albumRect, _placeholderPaint);
+                _placeholderPaint.Color = new SKColor(38, 42, 46);
+            }
+            canvas.Restore();
+        }
+
+        if (hover > 0.001f)
+            DrawSideActionButton(canvas, albumRect, state, hover);
+    }
+
+    private void DrawSideActionButton(SKCanvas canvas, SKRect rect, IslandSideIconState state, float hover)
+    {
+        var active = (float)Math.Clamp(state.Active, 0d, 1d);
+        var pressed = (float)Math.Clamp(state.Pressed, 0d, 1d);
+        var enabled = (float)Math.Clamp(state.Enabled, 0d, 1d);
+        var surfaceScale = 0.78f + 0.22f * hover;
+        var centerX = rect.MidX;
+        var centerY = rect.MidY;
+        var radius = rect.Width / 2f;
+
+        canvas.Save();
+        canvas.Translate(centerX, centerY);
+        canvas.Scale(surfaceScale);
+        canvas.Translate(-centerX, -centerY);
+
+        var backgroundAlpha = (byte)Math.Round((24f + 20f * pressed) * hover);
+        if (backgroundAlpha > 0)
+        {
+            _favoritePaint.Style = SKPaintStyle.Fill;
+            _favoritePaint.Color = new SKColor(255, 255, 255, backgroundAlpha);
+            canvas.DrawCircle(centerX, centerY, radius, _favoritePaint);
+        }
+
+        var sizeRatio = rect.Width / 44f;
+        var iconScale = (1f + 0.04f * hover - 0.08f * pressed) * sizeRatio;
+        var baseAlpha = Lerp(95f, 185f + 60f * Math.Max(hover, active), enabled) * hover;
+        switch (state.Action)
+        {
+            case IslandIconAction.Favorite:
+            {
+                var iconSize = 28f * iconScale;
+                var addAlpha = (byte)Math.Round(baseAlpha * (1f - active));
+                var checkAlpha = (byte)Math.Round(baseAlpha * active);
+                if (addAlpha > 0)
+                    DrawFavoriteIcon(canvas, centerX, centerY, iconSize, new SKColor(255, 255, 255, addAlpha), checkedState: false);
+                if (checkAlpha > 0)
+                    DrawFavoriteIcon(canvas, centerX, centerY, iconSize, new SKColor(255, 255, 255, checkAlpha), checkedState: true);
+                break;
+            }
+            case IslandIconAction.PlayPause:
+            {
+                var iconSize = 23f * iconScale;
+                var playAlpha = (byte)Math.Round(baseAlpha * (1f - active));
+                var pauseAlpha = (byte)Math.Round(baseAlpha * active);
+                if (playAlpha > 0)
+                    DrawActionIcon(canvas, centerX, centerY, iconSize, new SKColor(255, 255, 255, playAlpha), IslandIconAction.PlayPause, activeVariant: false);
+                if (pauseAlpha > 0)
+                    DrawActionIcon(canvas, centerX, centerY, iconSize, new SKColor(255, 255, 255, pauseAlpha), IslandIconAction.PlayPause, activeVariant: true);
+                break;
+            }
+            default:
+            {
+                var alpha = (byte)Math.Round(baseAlpha);
+                if (alpha > 0)
+                    DrawActionIcon(canvas, centerX, centerY, 23f * iconScale, new SKColor(255, 255, 255, alpha), state.Action, activeVariant: false);
+                break;
+            }
+        }
+
+        canvas.Restore();
+    }
+
+    private void DrawFavoriteIcon(SKCanvas canvas, float x, float y, float size, SKColor color, bool checkedState)
+    {
+        canvas.Save();
+        canvas.Translate(x, y);
+        canvas.Scale(size / 24f);
+        _favoritePaint.Color = color;
+        _favoritePaint.StrokeCap = SKStrokeCap.Round;
+        _favoritePaint.StrokeJoin = SKStrokeJoin.Round;
+        if (!checkedState)
+        {
+            _favoritePaint.Style = SKPaintStyle.Stroke;
+            _favoritePaint.StrokeWidth = 1.7f;
+            canvas.DrawCircle(0f, 0f, 10f - _favoritePaint.StrokeWidth / 2f, _favoritePaint);
+            canvas.DrawLine(-4.2f, 0f, 4.2f, 0f, _favoritePaint);
+            canvas.DrawLine(0f, -4.2f, 0f, 4.2f, _favoritePaint);
         }
         else
         {
-            canvas.DrawRect(albumRect, _placeholderPaint);
+            _favoritePaint.Style = SKPaintStyle.Stroke;
+            _favoritePaint.StrokeWidth = 2.1f;
+            _favoritePath.Reset();
+            _favoritePath.MoveTo(-4.2f, 0.2f);
+            _favoritePath.LineTo(-1.2f, 3.2f);
+            _favoritePath.LineTo(4.7f, -3.4f);
+            using (var cutout = _favoritePaint.GetFillPath(_favoritePath))
+                canvas.ClipPath(cutout, SKClipOperation.Difference, true);
+            _favoritePaint.Style = SKPaintStyle.Fill;
+            canvas.DrawCircle(0f, 0f, 10f, _favoritePaint);
         }
         canvas.Restore();
+    }
+
+    private void DrawActionIcon(
+        SKCanvas canvas,
+        float x,
+        float y,
+        float size,
+        SKColor color,
+        IslandIconAction action,
+        bool activeVariant)
+    {
+        canvas.Save();
+        canvas.Translate(x, y);
+        canvas.Scale(size / 24f);
+        _favoritePaint.Color = color;
+        _favoritePaint.StrokeCap = SKStrokeCap.Round;
+        _favoritePaint.StrokeJoin = SKStrokeJoin.Round;
+        switch (action)
+        {
+            case IslandIconAction.LyricsWindow:
+                _favoritePaint.Style = SKPaintStyle.Stroke;
+                _favoritePaint.StrokeWidth = 1.85f;
+                canvas.DrawLine(-7.5f, -5.8f, 7.5f, -5.8f, _favoritePaint);
+                canvas.DrawLine(-7.5f, 0f, 7.5f, 0f, _favoritePaint);
+                canvas.DrawLine(-7.5f, 5.8f, 2.5f, 5.8f, _favoritePaint);
+                break;
+            case IslandIconAction.PlayPause when !activeVariant:
+                _favoritePaint.Style = SKPaintStyle.StrokeAndFill;
+                _favoritePaint.StrokeWidth = 1.6f;
+                DrawTriangle(canvas, -4.5f, -7.8f, 7.8f, 0f, -4.5f, 7.8f);
+                break;
+            case IslandIconAction.PlayPause:
+                _favoritePaint.Style = SKPaintStyle.Fill;
+                canvas.DrawRoundRect(new SKRect(-6.2f, -7.8f, -2.0f, 7.8f), 1.5f, 1.5f, _favoritePaint);
+                canvas.DrawRoundRect(new SKRect(2.0f, -7.8f, 6.2f, 7.8f), 1.5f, 1.5f, _favoritePaint);
+                break;
+            case IslandIconAction.Previous:
+                _favoritePaint.Style = SKPaintStyle.StrokeAndFill;
+                _favoritePaint.StrokeWidth = 1.2f;
+                DrawTriangle(canvas, 8.5f, -6.8f, -0.5f, 0f, 8.5f, 6.8f);
+                DrawTriangle(canvas, -0.5f, -6.8f, -9.5f, 0f, -0.5f, 6.8f);
+                break;
+            case IslandIconAction.Next:
+                _favoritePaint.Style = SKPaintStyle.StrokeAndFill;
+                _favoritePaint.StrokeWidth = 1.2f;
+                DrawTriangle(canvas, -8.5f, -6.8f, 0.5f, 0f, -8.5f, 6.8f);
+                DrawTriangle(canvas, 0.5f, -6.8f, 9.5f, 0f, 0.5f, 6.8f);
+                break;
+            case IslandIconAction.Banner:
+                _favoritePaint.Style = SKPaintStyle.Stroke;
+                _favoritePaint.StrokeWidth = 1.75f;
+                canvas.DrawRoundRect(new SKRect(-8.2f, -6.5f, 8.2f, 6.5f), 2.2f, 2.2f, _favoritePaint);
+                _favoritePath.Reset();
+                _favoritePath.MoveTo(-6.2f, 4.5f);
+                _favoritePath.LineTo(-1.5f, 0.2f);
+                _favoritePath.LineTo(2.0f, 3.2f);
+                _favoritePath.LineTo(4.2f, 1.2f);
+                _favoritePath.LineTo(6.5f, 4.5f);
+                canvas.DrawPath(_favoritePath, _favoritePaint);
+                _favoritePaint.Style = SKPaintStyle.Fill;
+                canvas.DrawCircle(-3.8f, -2.2f, 1.35f, _favoritePaint);
+                break;
+            case IslandIconAction.TemporaryHide:
+                _favoritePaint.Style = SKPaintStyle.Stroke;
+                _favoritePaint.StrokeWidth = 1.75f;
+                canvas.DrawRoundRect(new SKRect(-9.2f, -4.4f, 9.2f, 4.4f), 4.4f, 4.4f, _favoritePaint);
+                canvas.DrawLine(-6.8f, 6.8f, 6.8f, -6.8f, _favoritePaint);
+                break;
+        }
+        canvas.Restore();
+    }
+
+    private void DrawTriangle(SKCanvas canvas, float x1, float y1, float x2, float y2, float x3, float y3)
+    {
+        _favoritePath.Reset();
+        _favoritePath.MoveTo(x1, y1);
+        _favoritePath.LineTo(x2, y2);
+        _favoritePath.LineTo(x3, y3);
+        _favoritePath.Close();
+        canvas.DrawPath(_favoritePath, _favoritePaint);
     }
 
     private void DrawAvatar(SKCanvas canvas, SKRect rect, int index, float opacity)
@@ -1286,12 +1878,13 @@ internal sealed class IslandRenderer : IDisposable
         float scale,
         float opacity,
         bool showTranslation,
-        float highlightEmphasis)
+        float highlightEmphasis,
+        bool englishWordEffects)
     {
         if (opacity <= 0.001f || scale <= 0.001f)
             return;
 
-        var layout = LayoutLine(line, mainFonts);
+        var layout = LayoutLine(line, mainFonts, englishWordEffects);
         var mainWidth = layout.Width;
         var translation = showTranslation ? line.Translation ?? string.Empty : string.Empty;
         var hasTranslation = !string.IsNullOrWhiteSpace(translation);
@@ -1479,13 +2072,14 @@ internal sealed class IslandRenderer : IDisposable
         MainFontSet mainFonts,
         SKFont translationFont,
         bool showTranslation,
-        float textScale)
+        float textScale,
+        bool englishWordEffects)
     {
         float mainWidth;
         float subWidth;
         if (line is not null)
         {
-            var layout = LayoutLine(line, mainFonts);
+            var layout = LayoutLine(line, mainFonts, englishWordEffects);
             mainWidth = layout.Width;
             subWidth = showTranslation ? layout.TranslationWidth : 0f;
         }
@@ -1552,8 +2146,25 @@ internal sealed class IslandRenderer : IDisposable
         MaskFilter = blur > 0f ? SKMaskFilter.CreateBlur(SKBlurStyle.Normal, blur) : null
     };
 
-    private KaraokeLayout LayoutLine(LyricLine line, MainFontSet fonts)
+    internal List<(double StartMs, double EndMs, int TextOffset)> GlyphTimings(LyricLine line, bool englishWordEffects)
     {
+        var mainFonts = new MainFontSet(_latinFont, _cjkFont, _japaneseFont);
+        var layout = LayoutLine(line, mainFonts, englishWordEffects);
+        return layout.Glyphs.Select(g => (g.StartMs, g.EndMs, g.TextOffset)).ToList();
+    }
+
+    private KaraokeLayout LayoutLine(LyricLine line, MainFontSet fonts, bool englishWordEffects)
+    {
+        if (_layoutWordEffects != englishWordEffects)
+        {
+            _karaokeLayout1?.Dispose();
+            _karaokeLayout2?.Dispose();
+            _karaokeLayout1 = null;
+            _karaokeLayout2 = null;
+            _layoutLine1 = null;
+            _layoutLine2 = null;
+            _layoutWordEffects = englishWordEffects;
+        }
         if (ReferenceEquals(line, _layoutLine1))
             return _karaokeLayout1!;
         if (ReferenceEquals(line, _layoutLine2))
@@ -1569,24 +2180,25 @@ internal sealed class IslandRenderer : IDisposable
             : _translationFont.MeasureText(line.Translation);
         return _karaokeLayout1 = new KaraokeLayout(
             runs,
-            BuildGlyphs(runs, line, width),
-            BuildSyllables(line, fonts),
+            BuildGlyphs(runs, line, width, englishWordEffects),
+            BuildSyllables(line, fonts, englishWordEffects),
             width,
             translationWidth);
     }
 
-    private static KaraokeSyllable[] BuildSyllables(LyricLine line, MainFontSet fonts)
+    private static KaraokeSyllable[] BuildSyllables(LyricLine line, MainFontSet fonts, bool englishWordEffects)
     {
-        if (line.Syllables.IsDefaultOrEmpty)
+        var sourceSyllables = LyricsTextLayout.EffectiveSyllables(line, englishWordEffects);
+        if (sourceSyllables.IsDefaultOrEmpty)
             return [];
 
         var japanese = line.Text.EnumerateRunes().Any(IsKana);
-        var syllables = new KaraokeSyllable[line.Syllables.Length];
+        var syllables = new KaraokeSyllable[sourceSyllables.Length];
         var builder = new StringBuilder(line.Text.Length);
         var prefixWidth = 0f;
-        for (var i = 0; i < line.Syllables.Length; i++)
+        for (var i = 0; i < sourceSyllables.Length; i++)
         {
-            var syllable = line.Syllables[i];
+            var syllable = sourceSyllables[i];
             var width = MeasureMainText(syllable.Text, fonts, japanese);
             syllables[i] = new KaraokeSyllable(syllable.StartMs, syllable.EndMs, prefixWidth, width);
             builder.Append(syllable.Text);
@@ -1595,12 +2207,18 @@ internal sealed class IslandRenderer : IDisposable
         return syllables;
     }
 
-    private static List<KaraokeGlyph> BuildGlyphs(List<MainTextRun> runs, LyricLine line, float lineWidth)
+    private static List<KaraokeGlyph> BuildGlyphs(
+        List<MainTextRun> runs,
+        LyricLine line,
+        float lineWidth,
+        bool englishWordEffects)
     {
         var glyphs = new List<KaraokeGlyph>();
         var textOffset = 0;
+        var nextWordGroup = 0;
         foreach (var run in runs)
         {
+            var items = new List<(string Text, float Offset, float Width, int TextOffset)>();
             var runOffset = 0;
             var previousWidth = 0f;
             var elements = StringInfo.GetTextElementEnumerator(run.Text);
@@ -1609,26 +2227,65 @@ internal sealed class IslandRenderer : IDisposable
                 var text = elements.GetTextElement();
                 runOffset += text.Length;
                 var width = run.Font.MeasureText(run.Text.AsSpan(0, runOffset));
-                glyphs.Add(new KaraokeGlyph(
-                    run.Font.GetTextPath(text, SKPoint.Empty), run.Offset + previousWidth,
-                    Math.Max(0.001f, width - previousWidth), textOffset));
+                items.Add((text, run.Offset + previousWidth, Math.Max(0.001f, width - previousWidth), textOffset));
                 previousWidth = width;
                 textOffset += text.Length;
             }
+
+            for (var i = 0; i < items.Count;)
+            {
+                if (englishWordEffects && LyricsTextLayout.IsLatinWordElement(items[i].Text))
+                {
+                    var end = i + 1;
+                    var hasLatin = LyricsTextLayout.ContainsLatinLetter(items[i].Text);
+                    while (end < items.Count && LyricsTextLayout.IsLatinWordElement(items[end].Text))
+                    {
+                        hasLatin |= LyricsTextLayout.ContainsLatinLetter(items[end].Text);
+                        end++;
+                    }
+                    var group = hasLatin ? nextWordGroup++ : -1;
+                    for (var j = i; j < end; j++)
+                    {
+                        var item = items[j];
+                        glyphs.Add(new KaraokeGlyph(
+                            run.Font.GetTextPath(item.Text, SKPoint.Empty),
+                            item.Offset,
+                            item.Width,
+                            item.TextOffset)
+                        { WordGroup = group });
+                    }
+                    i = end;
+                }
+                else
+                {
+                    var item = items[i];
+                    glyphs.Add(new KaraokeGlyph(
+                        run.Font.GetTextPath(item.Text, SKPoint.Empty),
+                        item.Offset,
+                        item.Width,
+                        item.TextOffset));
+                    i++;
+                }
+            }
         }
 
-        SetGlyphEndTimes(glyphs, line, lineWidth);
+        SetGlyphEndTimes(glyphs, line, lineWidth, englishWordEffects);
         return glyphs;
     }
 
-    private static void SetGlyphEndTimes(List<KaraokeGlyph> glyphs, LyricLine line, float lineWidth)
+    private static void SetGlyphEndTimes(
+        List<KaraokeGlyph> glyphs,
+        LyricLine line,
+        float lineWidth,
+        bool englishWordEffects)
     {
+        var syllables = LyricsTextLayout.EffectiveSyllables(line, englishWordEffects);
         var syllableOffset = 0;
         var glyphIndex = 0;
-        if (!line.Syllables.IsDefaultOrEmpty
-            && line.Syllables.Sum(syllable => syllable.Text.Length) == line.Text.Length)
+        if (!syllables.IsDefaultOrEmpty
+            && syllables.Sum(syllable => syllable.Text.Length) == line.Text.Length)
         {
-            foreach (var syllable in line.Syllables)
+            foreach (var syllable in syllables)
             {
                 var first = glyphIndex;
                 var endOffset = syllableOffset + syllable.Text.Length;
@@ -1637,10 +2294,35 @@ internal sealed class IslandRenderer : IDisposable
                 SetGlyphRangeEndTimes(glyphs, first, glyphIndex, syllable.StartMs, syllable.EndMs);
                 syllableOffset = endOffset;
             }
-            return;
+        }
+        else
+        {
+            SetGlyphRangeEndTimes(glyphs, 0, glyphs.Count, line.StartMs, line.EndMs, lineWidth);
         }
 
-        SetGlyphRangeEndTimes(glyphs, 0, glyphs.Count, line.StartMs, line.EndMs, lineWidth);
+        if (!englishWordEffects)
+            return;
+
+        for (var start = 0; start < glyphs.Count;)
+        {
+            var group = glyphs[start].WordGroup;
+            if (group < 0)
+            {
+                start++;
+                continue;
+            }
+            var end = start + 1;
+            while (end < glyphs.Count && glyphs[end].WordGroup == group)
+                end++;
+            var startMs = glyphs[start].StartMs;
+            var endMs = glyphs[end - 1].EndMs;
+            for (var i = start; i < end; i++)
+            {
+                glyphs[i].StartMs = startMs;
+                glyphs[i].EndMs = endMs;
+            }
+            start = end;
+        }
     }
 
     private static void SetGlyphRangeEndTimes(
@@ -1872,6 +2554,8 @@ internal sealed class IslandRenderer : IDisposable
         _edgeBloom.Dispose();
         _titlePaint.Dispose();
         _subtitlePaint.Dispose();
+        _favoritePaint.Dispose();
+        _favoritePath.Dispose();
         _latin.Dispose();
         _cjk.Dispose();
         _japanese.Dispose();
@@ -1897,6 +2581,7 @@ internal sealed class IslandRenderer : IDisposable
     {
         public double StartMs { get; set; }
         public double EndMs { get; set; }
+        public int WordGroup { get; init; } = -1;
     }
     private readonly record struct MainFontSet(SKFont Latin, SKFont Cjk, SKFont Japanese);
     private readonly record struct MainTextRun(string Text, SKFont Font, float Offset);

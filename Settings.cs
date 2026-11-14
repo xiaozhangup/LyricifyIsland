@@ -30,6 +30,18 @@ internal enum PlaybackSourcePreference
     Mpris
 }
 
+internal enum IslandIconAction
+{
+    None,
+    Favorite,
+    LyricsWindow,
+    PlayPause,
+    Previous,
+    Next,
+    Banner,
+    TemporaryHide
+}
+
 internal readonly record struct IslandSettings(
     double WidthPercent = SettingsStore.DefaultWidthPercent,
     double ScalePercent = SettingsStore.DefaultScalePercent,
@@ -56,7 +68,10 @@ internal readonly record struct IslandSettings(
     bool ShowIsland = true,
     int MaximumFrameRate = 0,
     VerticalSyncMode VerticalSync = VerticalSyncMode.Enabled,
-    bool BackgroundBlur = false)
+    bool BackgroundBlur = false,
+    bool EnglishWordEffects = false,
+    IslandIconAction LeftIconAction = IslandIconAction.LyricsWindow,
+    IslandIconAction RightIconAction = IslandIconAction.Favorite)
 {
     public bool HasSpotifyCredentials =>
         !string.IsNullOrWhiteSpace(SpotifyClientId)
@@ -165,7 +180,10 @@ internal static class SettingsStore
                 data?.ShowIsland ?? true,
                 data?.MaximumFrameRate ?? 0,
                 data?.VerticalSync ?? VerticalSyncMode.Enabled,
-                data?.BackgroundBlur ?? false));
+                data?.BackgroundBlur ?? false,
+                data?.EnglishWordEffects ?? false,
+                data?.LeftIconAction ?? IslandIconAction.LyricsWindow,
+                data?.RightIconAction ?? IslandIconAction.Favorite));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -215,7 +233,10 @@ internal static class SettingsStore
                     ShowIsland = settings.ShowIsland,
                     MaximumFrameRate = settings.MaximumFrameRate,
                     VerticalSync = settings.VerticalSync,
-                    BackgroundBlur = settings.BackgroundBlur
+                    BackgroundBlur = settings.BackgroundBlur,
+                    EnglishWordEffects = settings.EnglishWordEffects,
+                    LeftIconAction = settings.LeftIconAction,
+                    RightIconAction = settings.RightIconAction
                 }));
             Secure(temporary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             File.Move(temporary, path, overwrite: true);
@@ -282,6 +303,12 @@ internal static class SettingsStore
             TemporaryHideSeconds = NormalizeTemporaryHideSeconds(settings.TemporaryHideSeconds),
             MaximumFrameRate = NormalizeFrameRate(settings.MaximumFrameRate),
             VerticalSync = Enum.IsDefined(settings.VerticalSync) ? settings.VerticalSync : VerticalSyncMode.Enabled,
+            LeftIconAction = Enum.IsDefined(settings.LeftIconAction)
+                ? settings.LeftIconAction
+                : IslandIconAction.LyricsWindow,
+            RightIconAction = Enum.IsDefined(settings.RightIconAction)
+                ? settings.RightIconAction
+                : IslandIconAction.Favorite,
             DisplayId = string.IsNullOrWhiteSpace(settings.DisplayId) ? null : settings.DisplayId.Trim(),
             WindowX = settings.RememberPosition ? settings.WindowX : null,
             WindowY = settings.RememberPosition ? settings.WindowY : null,
@@ -370,6 +397,9 @@ internal static class SettingsStore
         public int? MaximumFrameRate { get; init; }
         public VerticalSyncMode? VerticalSync { get; init; }
         public bool? BackgroundBlur { get; init; }
+        public bool? EnglishWordEffects { get; init; }
+        public IslandIconAction? LeftIconAction { get; init; }
+        public IslandIconAction? RightIconAction { get; init; }
     }
 }
 

@@ -361,6 +361,9 @@ internal sealed class SettingsPage : PanelPage
             Ui.Row("显示翻译", "有翻译时在原文下方显示",
                 Switch("显示歌词翻译", settings.ShowTranslation,
                     value => Commit(settings with { ShowTranslation = value }))),
+            Ui.Row("英文整词特效", "开启后英文歌词按整个单词产生跳字与发光特效，而非逐个字母",
+                Switch("英文整词特效", settings.EnglishWordEffects,
+                    value => Commit(settings with { EnglishWordEffects = value }))),
             Ui.Row("首选歌词源", "自动模式优先使用逐字歌词；首选源没有结果时继续尝试其他来源",
                 Pick("首选歌词源",
                     [
@@ -428,15 +431,91 @@ internal sealed class SettingsPage : PanelPage
                     value => Commit(settings with { BackgroundBlur = value }))));
 
         // ── 交互 ────────────────────────────────────────────────────────────────
+        var iconActionChoices = new[]
+        {
+            (IslandIconAction.None, "关闭"),
+            (IslandIconAction.LyricsWindow, "歌词窗口"),
+            (IslandIconAction.Favorite, "收藏歌曲"),
+            (IslandIconAction.PlayPause, "播放/暂停"),
+            (IslandIconAction.Previous, "上一首"),
+            (IslandIconAction.Next, "下一首"),
+            (IslandIconAction.Banner, "分享图"),
+            (IslandIconAction.TemporaryHide, "临时隐藏")
+        };
+
+        Border SideIconActionRow(
+            string title,
+            string description,
+            string automationName,
+            IslandIconAction initial,
+            IslandIconAction fallback,
+            Action<IslandIconAction> apply)
+        {
+            var lastActive = initial != IslandIconAction.None ? initial : fallback;
+            var syncing = false;
+            var toggle = Ui.Toggle($"启用{automationName}", initial != IslandIconAction.None);
+            var segmented = new Segmented<IslandIconAction>(automationName, fill: true);
+            segmented.Set(iconActionChoices, candidate => candidate == initial);
+
+            void Select(IslandIconAction next)
+            {
+                if (syncing)
+                    return;
+                if (next != IslandIconAction.None)
+                    lastActive = next;
+                syncing = true;
+                toggle.IsChecked = next != IslandIconAction.None;
+                segmented.Set(iconActionChoices, candidate => candidate == next);
+                syncing = false;
+                apply(next);
+            }
+
+            toggle.IsCheckedChanged += (_, _) =>
+                Select(toggle.IsChecked == true ? lastActive : IslandIconAction.None);
+            segmented.Changed += Select;
+
+            var labels = new StackPanel
+            {
+                Spacing = 3,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children = { Ui.Text(title, 14, FontWeight.SemiBold), Ui.Text(description, 12, muted: true) }
+            };
+            var header = new Grid
+            {
+                ColumnDefinitions = new ColumnDefinitions("*,24,Auto"),
+                Children = { labels, toggle }
+            };
+            Grid.SetColumn(toggle, 2);
+            return Ui.Block(new StackPanel
+            {
+                Spacing = 12,
+                Children = { header, segmented }
+            });
+        }
+
         var positionSection = Ui.Section(
             "交互",
-            "控制拖动和鼠标穿透",
+            "控制拖动、鼠标穿透和两侧图标悬浮快捷操作",
             Ui.Row("锁定位置", "禁止鼠标拖动，双击隐藏仍可使用",
                 Switch("锁定岛屿位置", settings.LockPosition,
                     value => Commit(settings with { LockPosition = value }))),
             Ui.Row("鼠标完全穿透", "开启后岛屿不接收鼠标操作，可从设置窗口关闭",
                 Switch("鼠标完全穿透", settings.ClickThrough,
-                    value => Commit(settings with { ClickThrough = value }))));
+                    value => Commit(settings with { ClickThrough = value }))),
+            SideIconActionRow(
+                "左侧图标悬浮操作",
+                "鼠标悬停在灵动岛左侧图标时切换为快捷按钮",
+                "左侧图标悬浮操作",
+                settings.LeftIconAction,
+                IslandIconAction.LyricsWindow,
+                value => Commit(settings with { LeftIconAction = value })),
+            SideIconActionRow(
+                "右侧图标悬浮操作",
+                "鼠标悬停在灵动岛右侧封面时切换为快捷按钮",
+                "右侧图标悬浮操作",
+                settings.RightIconAction,
+                IslandIconAction.Favorite,
+                value => Commit(settings with { RightIconAction = value })));
 
         // ── 行为 ────────────────────────────────────────────────────────────────
         var behaviorSection = Ui.Section(

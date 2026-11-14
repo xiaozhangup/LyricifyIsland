@@ -2,7 +2,7 @@
 set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-version="${1:-0.1.12}"
+version="${1:-0.1.13}"
 topdir="$(mktemp -d)"
 trap 'rm -rf -- "$topdir"' EXIT
 

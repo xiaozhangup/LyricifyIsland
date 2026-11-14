@@ -32,6 +32,7 @@ internal sealed record LyricsWindowFrame(
     /// <summary>0 = lyrics page, 1 = a settings/headphone panel covers the player and lyrics.</summary>
     public double PanelProgress { get; init; }
     public PanelKind? ActivePanel { get; init; }
+    public bool EnglishWordEffects { get; init; }
 }
 
 internal sealed record LyricsWindowLayout(Rect Surface, Rect Lyrics, Rect Cover, Rect Progress,
@@ -144,6 +145,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
     private double _headphoneExpansion;
     private double _headphoneNoiseExpansion;
     private bool _translation;
+    private bool _englishWordEffects;
     private bool _reset = true;
     private int _active = -1;
     private double _changedAt;
@@ -213,7 +215,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
                 Transport = Mix(normal.Transport, lyricsOnly.Transport, _lyricsOnlyProgress),
                 FontSize = (float)Mix(normal.FontSize, lyricsOnly.FontSize, _lyricsOnlyProgress)
             };
-            EnsureTrack(frame.Snapshot.Track, normal, lyricsOnly, frame.ShowTranslation, frame.Seconds);
+            EnsureTrack(frame.Snapshot.Track, normal, lyricsOnly, frame.ShowTranslation,
+                frame.EnglishWordEffects, frame.Seconds);
             _hits.Clear();
             canvas.Save();
             var rect = ToSk(layout.Surface);
@@ -338,7 +341,7 @@ internal sealed class LyricsWindowRenderer : IDisposable
         new SKSamplingOptions(SKFilterMode.Linear));
 
     private void EnsureTrack(TrackInfo? track, LyricsWindowLayout layout, LyricsWindowLayout lyricsOnly,
-        bool translation, double seconds)
+        bool translation, bool englishWordEffects, double seconds)
     {
         if (_trackId != track?.Id)
         {
@@ -390,13 +393,15 @@ internal sealed class LyricsWindowRenderer : IDisposable
         var lyrics = track?.Lyrics ?? [];
         if (_lyrics.Equals(lyrics) && _layoutWidth == (float)layout.Lyrics.Width
             && _layoutFont == layout.FontSize && _lyricsOnlyWidth == (float)lyricsOnly.Lyrics.Width
-            && _lyricsOnlyFont == lyricsOnly.FontSize && _translation == translation) return;
+            && _lyricsOnlyFont == lyricsOnly.FontSize && _translation == translation
+            && _englishWordEffects == englishWordEffects) return;
         _lyrics = lyrics;
         _layoutWidth = (float)layout.Lyrics.Width;
         _layoutFont = layout.FontSize;
         _lyricsOnlyWidth = (float)lyricsOnly.Lyrics.Width;
         _lyricsOnlyFont = lyricsOnly.FontSize;
         _translation = translation;
+        _englishWordEffects = englishWordEffects;
         ClearRows();
         var top = 0f;
         var lyricsOnlyTop = 0f;
@@ -413,7 +418,8 @@ internal sealed class LyricsWindowRenderer : IDisposable
 
         RowLayout CreateRow(LyricLine line, float width, float font, float rowTop)
         {
-            var text = new LyricsTextLayout(line.Text, font, width - LyricHorizontalPadding * 2, _fonts, timing: line);
+            var text = new LyricsTextLayout(line.Text, font, width - LyricHorizontalPadding * 2, _fonts,
+                timing: line, wordEffects: englishWordEffects);
             var translated = translation && !string.IsNullOrWhiteSpace(line.Translation)
                 ? new LyricsTextLayout(line.Translation, font * .53f, width - LyricHorizontalPadding * 2, _fonts, false) : null;
             return new RowLayout(text, translated, rowTop);
@@ -1031,15 +1037,23 @@ internal sealed class LyricsWindowRenderer : IDisposable
             canvas.DrawPath(glyph.Path, idle);
             if (progress > 0 && emphasis > .005)
             {
-                var edge = (float)progress * glyph.Width;
+                var edge = (float)progress * glyph.EffectWidth - glyph.EffectOffset;
                 if (singing && glyph.SyllableDurationMs > 450) canvas.DrawPath(glyph.Path, glow);
                 if (progress < 1)
                 {
-                    using var shader = SKShader.CreateLinearGradient(new SKPoint(edge - 5, 0), new SKPoint(edge + 3, 0),
-                        [White((byte)(240 * emphasis)), SKColors.Transparent], null, SKShaderTileMode.Clamp);
-                    bright.Shader = shader;
-                    canvas.DrawPath(glyph.Path, bright);
-                    bright.Shader = null;
+                    if (edge > -3)
+                    {
+                        if (edge - 5 >= glyph.Width)
+                            canvas.DrawPath(glyph.Path, bright);
+                        else
+                        {
+                            using var shader = SKShader.CreateLinearGradient(new SKPoint(edge - 5, 0), new SKPoint(edge + 3, 0),
+                                [White((byte)(240 * emphasis)), SKColors.Transparent], null, SKShaderTileMode.Clamp);
+                            bright.Shader = shader;
+                            canvas.DrawPath(glyph.Path, bright);
+                            bright.Shader = null;
+                        }
+                    }
                 }
                 else canvas.DrawPath(glyph.Path, bright);
             }

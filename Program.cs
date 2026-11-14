@@ -376,9 +376,16 @@ public sealed class App : Application
             _store.Update(snapshot with
             {
                 IsPlaying = command.Action == PlaybackAction.PlayPause ? !snapshot.IsPlaying : snapshot.IsPlaying,
-                ReportedPositionMs = command.Action == PlaybackAction.Seek
-                    ? (long)Math.Clamp(command.Value, 0, DemoSource.Track.DurationMs - 1) : (long)snapshot.PositionMs,
-                ReportedAtTimestamp = Stopwatch.GetTimestamp()
+                ReportedPositionMs = command.Action switch
+                {
+                    PlaybackAction.Seek => (long)Math.Clamp(command.Value, 0, DemoSource.Track.DurationMs - 1),
+                    PlaybackAction.Previous or PlaybackAction.Next => 0,
+                    _ => (long)snapshot.PositionMs
+                },
+                ReportedAtTimestamp = Stopwatch.GetTimestamp(),
+                Controls = command.Action == PlaybackAction.Favorite
+                    ? snapshot.Controls with { IsFavorite = command.Value > 0 }
+                    : snapshot.Controls
             });
             return null;
         }
@@ -516,7 +523,7 @@ internal static class DemoSource
     public static async Task RunAsync(PlaybackStore store, CancellationToken cancellationToken)
     {
         store.Update(new PlaybackSnapshot(Track, 0, Stopwatch.GetTimestamp(), true, "演示模式")
-        { Controls = new PlaybackControls(true, false, false, true) });
+        { Controls = new PlaybackControls(true, true, true, true, CanFavorite: true, IsFavorite: false) });
         while (!cancellationToken.IsCancellationRequested)
         {
             await Task.Delay(100, cancellationToken);
@@ -808,6 +815,30 @@ internal static class SelfCheck
         var pillBounds = hitTestRenderer.CalculatePillBounds(960, 116, hitTestFrame);
         Require(IslandRenderer.HitTest(pillBounds, new Point(480, 58)), "island hit test");
         Require(!IslandRenderer.HitTest(pillBounds, new Point(0, 0)), "transparent hit test");
+        var avatarBounds = IslandRenderer.AvatarBounds(pillBounds, 1d, 1d);
+        var albumBounds = IslandRenderer.AlbumBounds(pillBounds, 1d, 1d);
+        Require(IslandRenderer.HitTestAvatar(pillBounds, 1d, 1d, avatarBounds.Center)
+                && !IslandRenderer.HitTestAvatar(pillBounds, 1d, 1d, new Point(480, 58))
+                && !IslandRenderer.HitTestAvatar(default, 1d, 0d, avatarBounds.Center)
+                && !IslandRenderer.HitTestAvatar(pillBounds, 1d, 1d, albumBounds.Center)
+                && IslandRenderer.HitTestFavorite(pillBounds, 1d, 1d, albumBounds.Center)
+                && !IslandRenderer.HitTestFavorite(pillBounds, 1d, 1d, avatarBounds.Center)
+                && !IslandRenderer.HitTestFavorite(pillBounds, 1d, 1d, new Point(480, 58))
+                && !IslandRenderer.HitTestFavorite(default, 1d, 0d, albumBounds.Center),
+            "island side icon hit test");
+        using (var favoriteSurface = SKSurface.Create(new SKImageInfo(960, 116, SKColorType.Rgba8888, SKAlphaType.Premul)))
+        {
+            foreach (var action in Enum.GetValues<IslandIconAction>())
+            {
+                hitTestRenderer.Draw(favoriteSurface.Canvas, 960, 116,
+                    hitTestFrame with
+                    {
+                        LeftIcon = new IslandSideIconState(action, Hover: 1d, Active: 0d, Pressed: 0d, Enabled: 1d),
+                        RightIcon = new IslandSideIconState(action, Hover: 1d, Active: 1d, Pressed: 1d, Enabled: 1d)
+                    }, pillBounds);
+            }
+        }
+        CheckEnglishWordEffects(track, hitTestRenderer);
         var inputRows = NativeOverlay.CapsuleRows(new PixelRect(10, 20, 100, 40));
         Require(inputRows.Length == 40
                 && inputRows[0].X > 10
@@ -816,6 +847,55 @@ internal static class SelfCheck
 
         Console.WriteLine("self-test: ok");
         return 0;
+    }
+
+    private static void CheckEnglishWordEffects(TrackInfo track, IslandRenderer islandRenderer)
+    {
+        using var fonts = new LyricsFonts();
+        var mixedLine = track.Lyrics[1];
+        using var charLayout = new LyricsTextLayout(
+            mixedLine.Text, 30f, 600f, fonts, timing: mixedLine, wordEffects: false);
+        using var wordLayout = new LyricsTextLayout(
+            mixedLine.Text, 30f, 600f, fonts, timing: mixedLine, wordEffects: true);
+        Require(charLayout.Glyphs[0].StartMs != charLayout.Glyphs[1].StartMs
+                && charLayout.Glyphs[1].StartMs != charLayout.Glyphs[2].StartMs,
+            "per-character English layout timings");
+        Require(wordLayout.Glyphs[0].StartMs == wordLayout.Glyphs[1].StartMs
+                && wordLayout.Glyphs[1].StartMs == wordLayout.Glyphs[2].StartMs
+                && wordLayout.Glyphs[0].EndMs == wordLayout.Glyphs[2].EndMs
+                && wordLayout.Glyphs[0].EffectWidth > wordLayout.Glyphs[0].Width,
+            "whole-word English layout timings");
+        Require(wordLayout.Glyphs[^2].StartMs != wordLayout.Glyphs[^1].StartMs,
+            "per-character CJK timings preserved when English word effects enabled");
+
+        var splitWordLine = new LyricLine(
+            "Hello world",
+            null,
+            1_000,
+            2_200,
+            [
+                new LyricSyllable("Hel", 1_000, 1_300),
+                new LyricSyllable("lo ", 1_300, 1_600),
+                new LyricSyllable("world", 1_600, 2_200)
+            ]);
+        using var splitWordLayout = new LyricsTextLayout(
+            splitWordLine.Text, 30f, 600f, fonts, timing: splitWordLine, wordEffects: true);
+        Require(splitWordLayout.Glyphs[0].StartMs == 1_000
+                && splitWordLayout.Glyphs[4].StartMs == 1_000
+                && splitWordLayout.Glyphs[0].EndMs == 1_600
+                && splitWordLayout.Glyphs[4].EndMs == 1_600,
+            "multi-syllable English word merged for whole-word effects");
+
+        var islandCharTimings = islandRenderer.GlyphTimings(mixedLine, englishWordEffects: false);
+        var islandWordTimings = islandRenderer.GlyphTimings(mixedLine, englishWordEffects: true);
+        Require(islandCharTimings[0].StartMs != islandCharTimings[1].StartMs
+                && islandCharTimings[1].StartMs != islandCharTimings[2].StartMs,
+            "island per-character English timings");
+        Require(islandWordTimings[0].StartMs == islandWordTimings[1].StartMs
+                && islandWordTimings[1].StartMs == islandWordTimings[2].StartMs
+                && islandWordTimings[0].EndMs == islandWordTimings[2].EndMs
+                && islandWordTimings[^2].StartMs != islandWordTimings[^1].StartMs,
+            "island whole-word English timings with per-character CJK preserved");
     }
 
     private static void CheckHeadphones()
@@ -851,6 +931,18 @@ internal static class SelfCheck
         try
         {
             Environment.SetEnvironmentVariable("XDG_CONFIG_HOME", configHome);
+            var defaults = SettingsStore.Load();
+            Require(defaults.LeftIconAction == IslandIconAction.LyricsWindow
+                    && defaults.RightIconAction == IslandIconAction.Favorite,
+                "default side icon actions");
+            var normalizedInvalid = SettingsStore.Normalize(defaults with
+            {
+                LeftIconAction = (IslandIconAction)999,
+                RightIconAction = (IslandIconAction)(-1)
+            });
+            Require(normalizedInvalid.LeftIconAction == IslandIconAction.LyricsWindow
+                    && normalizedInvalid.RightIconAction == IslandIconAction.Favorite,
+                "invalid side icon action normalization");
             var expected = new IslandSettings(
                 80d,
                 120d,
@@ -872,7 +964,10 @@ internal static class SelfCheck
             {
                 LyricsSource = LyricsSourcePreference.Kugou,
                 EnableTrackOffsets = true,
-                PlaybackSource = PlaybackSourcePreference.Mpris
+                PlaybackSource = PlaybackSourcePreference.Mpris,
+                EnglishWordEffects = true,
+                LeftIconAction = IslandIconAction.PlayPause,
+                RightIconAction = IslandIconAction.Banner
             };
             expected = expected.WithTrackOffset("track-a", "测试歌曲 — 测试歌手", -275);
             expected = expected.WithTrackOffset("track-zero", "零偏移歌曲", 0);

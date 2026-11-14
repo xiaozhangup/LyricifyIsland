@@ -270,7 +270,7 @@ internal sealed class Segmented<T> : Border
                 Content = label,
                 Height = 32,
                 MinWidth = _fill ? 0 : 64,
-                Padding = new Thickness(14, 0),
+                Padding = new Thickness(_fill ? 6 : 14, 0),
                 Margin = new Thickness(i == 0 ? 0 : 2, 0, 0, 0),
                 Background = Brushes.Transparent,
                 Foreground = LyricsTheme.PrimaryText,

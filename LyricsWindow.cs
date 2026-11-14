@@ -351,7 +351,8 @@ internal sealed class LyricsWindowControl : Control, IDisposable
             PressedAction = _pressed?.Action,
             Headphones = _headphoneStatus,
             PanelProgress = PanelProgress(_clock.Elapsed.TotalSeconds),
-            ActivePanel = _panelKind
+            ActivePanel = _panelKind,
+            EnglishWordEffects = _settings.EnglishWordEffects
         };
         context.Custom(new LyricsWindowDrawOperation(new Rect(Bounds.Size), _renderer, frame));
     }
